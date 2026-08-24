@@ -2,7 +2,8 @@ import os
 import asyncio
 import threading
 import requests
-
+import pandas as pd
+import numpy as np
 from flask import Flask
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
