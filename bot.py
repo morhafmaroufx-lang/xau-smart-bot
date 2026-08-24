@@ -222,61 +222,219 @@ def calculate_signal_score(
     # CONFIDENCE
     # -----------------------------------------------------
 
-    confidence = min(
-        raw_score,
-        100
-    )
+    confidendef calculate_signal_score(
+    price,
+    ema20,
+    ema50,
+    ema200,
+    rsi,
+    macd,
+    signal,
+    tick_volume,
+    average_volume
+):
 
-    # -----------------------------------------------------
+    bullish = 0
+    bearish = 0
+    warnings = []
+
+    # =====================================================
+    # 1. EMA TREND - 40 POINTS
+    # =====================================================
+
+    if price > ema20 > ema50 > ema200:
+
+        bullish += 40
+
+    elif price < ema20 < ema50 < ema200:
+
+        bearish += 40
+
+    elif price > ema20 > ema50:
+
+        bullish += 30
+
+    elif price < ema20 < ema50:
+
+        bearish += 30
+
+    elif price > ema20:
+
+        bullish += 20
+
+    elif price < ema20:
+
+        bearish += 20
+
+    # =====================================================
+    # 2. RSI - 15 POINTS
+    # =====================================================
+
+    if 50 <= rsi < 70:
+
+        bullish += 15
+
+    elif 30 < rsi < 50:
+
+        bearish += 15
+
+    elif rsi >= 70:
+
+        # تشبع شرائي لا يعني بيع مباشرة
+        if bullish > bearish:
+
+            bullish += 8
+
+            warnings.append(
+                "⚠️ RSI مرتفع - احتمال تصحيح"
+            )
+
+        else:
+
+            warnings.append(
+                "⚠️ RSI تشبع شرائي"
+            )
+
+    elif rsi <= 30:
+
+        # تشبع بيعي لا يعني شراء مباشرة
+        if bearish > bullish:
+
+            bearish += 8
+
+            warnings.append(
+                "⚠️ RSI منخفض - احتمال ارتداد"
+            )
+
+        else:
+
+            warnings.append(
+                "⚠️ RSI تشبع بيعي"
+            )
+
+    # =====================================================
+    # 3. MACD - 25 POINTS
+    # =====================================================
+
+    if macd > signal:
+
+        bullish += 25
+
+    elif macd < signal:
+
+        bearish += 25
+
+    # =====================================================
     # MACD CONFLICT
-    # -----------------------------------------------------
+    # =====================================================
 
-    if signal_type == "BUY" and macd < signal:
+    # إذا الاتجاه العام صاعد لكن MACD ضعيف
+    # لا نحوله مباشرة إلى SELL
 
-        confidence -= 15
+    if bullish > bearish and macd < signal:
 
-        warnings.append(
-            "MACD لا يؤكد الصعود"
+        bearish -= min(
+            bearish,
+            10
         )
 
-    if signal_type == "SELL" and macd > signal:
-
-        confidence -= 15
-
         warnings.append(
-            "MACD لا يؤكد الهبوط"
+            "⚠️ MACD ضعيف أمام الاتجاه الصاعد"
         )
 
-    # -----------------------------------------------------
-    # VOLUME WARNING
-    # -----------------------------------------------------
+    # إذا الاتجاه العام هابط لكن MACD بدأ يتحسن
+    # لا نحوله مباشرة إلى BUY
+
+    if bearish > bullish and macd > signal:
+
+        bullish -= min(
+            bullish,
+            10
+        )
+
+        warnings.append(
+            "⚠️ MACD يتحسن أمام الاتجاه الهابط"
+        )
+
+    # =====================================================
+    # 4. VOLUME - 20 POINTS
+    # =====================================================
+
+    volume_confirmed = False
+
+    if average_volume > 0:
+
+        volume_ratio = (
+            tick_volume / average_volume
+        )
+
+        if volume_ratio >= 1.20:
+
+            volume_confirmed = True
+
+            if bullish > bearish:
+
+                bullish += 20
+
+            elif bearish > bullish:
+
+                bearish += 20
 
     if not volume_confirmed:
 
         warnings.append(
-            "Volume لا يعطي تأكيدًا قويًا"
+            "ℹ️ Volume لا يؤكد الحركة بقوة"
         )
 
-    # -----------------------------------------------------
-    # LIMIT CONFIDENCE
-    # -----------------------------------------------------
+    # =====================================================
+    # FINAL DIRECTION
+    # =====================================================
 
-    confidence = max(
-        0,
-        min(confidence, 100)
-    )
+    if bullish > bearish:
 
-    # -----------------------------------------------------
-    # WEAK SIGNAL = WAIT
-    # -----------------------------------------------------
+        signal_type = "BUY"
 
-    if confidence < 60:
+        confidence = bullish
 
-        final_signal = "WAIT"
+    elif bearish > bullish:
+
+        signal_type = "SELL"
+
+        confidence = bearish
 
     else:
 
+        signal_type = "WAIT"
+
+        confidence = 0
+
+    # =====================================================
+    # CONFIDENCE LIMIT
+    # =====================================================
+
+    confidence = max(
+        0,
+        min(
+            confidence,
+            100
+        )
+    )
+
+    # =====================================================
+    # SIGNAL FILTER
+    # =====================================================
+
+    if confidence >= 65:
+
         final_signal = signal_type
+
+    elif confidence >= 50:
+
+        final_signal = "WATCH"
+
+    else:
+
+        final_signal = "WAIT"
 
     return (
         final_signal,
