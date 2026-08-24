@@ -259,17 +259,24 @@ async def weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⏳ سيتم ربط البيانات الحقيقية في الخطوة التالية."
     )
 
-
 async def daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         intervals = ["1d", "4h", "1h"]
+
         names = {
             "1d": "D1",
             "4h": "H4",
             "1h": "H1"
         }
 
+        weights = {
+            "1d": 0.40,
+            "4h": 0.35,
+            "1h": 0.25
+        }
+
         results = []
+        weighted_scores = []
 
         for interval in intervals:
 
@@ -300,43 +307,47 @@ async def daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 continue
 
-            # تحويل البيانات إلى DataFrame
             df = pd.DataFrame(bars)
 
-            # ترتيب الشموع من الأقدم إلى الأحدث
+            # ترتيب الشموع من الأقدم للأحدث
             df = df.sort_values("openTime")
 
-            # تحويل الأسعار إلى أرقام
-            df["open"] = pd.to_numeric(df["open"])
-            df["high"] = pd.to_numeric(df["high"])
-            df["low"] = pd.to_numeric(df["low"])
-            df["close"] = pd.to_numeric(df["close"])
+            for column in [
+                "open",
+                "high",
+                "low",
+                "close",
+                "tickVolume"
+            ]:
+                df[column] = pd.to_numeric(
+                    df[column],
+                    errors="coerce"
+                )
+
+            df = df.dropna()
 
             close = df["close"]
 
-            # EMA
+            # =========================
+            # Indicators
+            # =========================
+
             ema20 = calculate_ema(
-                close,
-                20
+                close, 20
             ).iloc[-1]
 
             ema50 = calculate_ema(
-                close,
-                50
+                close, 50
             ).iloc[-1]
 
             ema200 = calculate_ema(
-                close,
-                200
+                close, 200
             ).iloc[-1]
 
-            # RSI
             rsi = calculate_rsi(
-                close,
-                14
+                close, 14
             ).iloc[-1]
 
-            # MACD
             macd, signal, histogram = calculate_macd(
                 close,
                 8,
@@ -346,9 +357,7 @@ async def daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             macd_value = macd.iloc[-1]
             signal_value = signal.iloc[-1]
-            histogram_value = histogram.iloc[-1]
 
-            # ATR
             atr = calculate_atr(
                 df["high"],
                 df["low"],
@@ -358,44 +367,57 @@ async def daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             current_price = close.iloc[-1]
 
+            tick_volume = df["tickVolume"].iloc[-1]
+
+            average_volume = (
+                df["tickVolume"]
+                .tail(20)
+                .mean()
+            )
+
             # =========================
-            # Trend calculation
+            # Signal Score
             # =========================
 
-            bullish_points = 0
-            bearish_points = 0
+            signal_type, score = calculate_signal_score(
+                current_price,
+                ema20,
+                ema50,
+                ema200,
+                rsi,
+                macd_value,
+                signal_value,
+                tick_volume,
+                average_volume
+            )
 
-            if current_price > ema20:
-                bullish_points += 1
+            # تحويل BUY إلى موجب
+            # و SELL إلى سالب
+            if signal_type == "BUY":
+                directional_score = score
+
+            elif signal_type == "SELL":
+                directional_score = -score
+
             else:
-                bearish_points += 1
+                directional_score = 0
 
-            if ema20 > ema50:
-                bullish_points += 1
-            else:
-                bearish_points += 1
+            weighted_scores.append(
+                directional_score * weights[interval]
+            )
 
-            if ema50 > ema200:
-                bullish_points += 1
-            else:
-                bearish_points += 1
+            # =========================
+            # Trend
+            # =========================
 
-            if rsi > 50:
-                bullish_points += 1
-            else:
-                bearish_points += 1
-
-            if macd_value > signal_value:
-                bullish_points += 1
-            else:
-                bearish_points += 1
-
-            if bullish_points > bearish_points:
+            if current_price > ema20 and ema20 > ema50:
                 trend = "🟢 صاعد"
-            elif bearish_points > bullish_points:
+
+            elif current_price < ema20 and ema20 < ema50:
                 trend = "🔴 هابط"
+
             else:
-                trend = "🟡 محايد"
+                trend = "🟡 متذبذب"
 
             results.append(
                 f"📊 {names[interval]}\n"
@@ -407,19 +429,48 @@ async def daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"MACD: {macd_value:.4f}\n"
                 f"Signal: {signal_value:.4f}\n"
                 f"ATR: {atr:.2f}\n"
-                f"Trend: {trend}"
+                f"Volume: {tick_volume:.0f}\n"
+                f"Trend: {trend}\n"
+                f"Signal: {signal_type}\n"
+                f"Score: {score}%"
             )
+
+        # =========================
+        # Multi-Timeframe Result
+        # =========================
+
+        final_score = sum(weighted_scores)
+
+        if final_score >= 60:
+            final_signal = "🟢 BUY"
+
+        elif final_score <= -60:
+            final_signal = "🔴 SELL"
+
+        else:
+            final_signal = "🟡 WAIT"
+
+        confidence = min(
+            abs(final_score),
+            100
+        )
 
         message = (
             "🤖 XAU SMART BOT\n\n"
             "📊 DAILY ANALYSIS\n\n"
             + "\n\n".join(results)
             + "\n\n"
-            "🎯 المرحلة التالية:\n"
-            "دمج الفريمات وحساب Confidence %."
+            "━━━━━━━━━━━━━━\n"
+            f"🎯 FINAL SIGNAL: {final_signal}\n"
+            f"💪 CONFIDENCE: {confidence:.0f}%\n"
+            "━━━━━━━━━━━━━━\n\n"
+            "⚠️ Confidence = درجة توافق المؤشرات "
+            "وليست احتمال ربح."
         )
 
-        await update.message.reply_text(message)
+        await update.message.reply_text(
+            message
+        )
 
     except requests.exceptions.Timeout:
         await update.message.reply_text(
