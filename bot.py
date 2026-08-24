@@ -38,33 +38,40 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⏳ الحالة: اختبار"
     )
 
-
 async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
+        url = "https://biquote.io/api/XAUUSD/ohlc?interval=5m&limit=5"
+
         response = requests.get(
-            "https://api.goldprice.dev/v1/latest",
-            timeout=10
+            url,
+            timeout=15
         )
 
         if response.status_code != 200:
             await update.message.reply_text(
-                "⚠️ تعذر الحصول على سعر الذهب حاليًا."
+                f"⚠️ مصدر البيانات لم يستجب.\n"
+                f"HTTP: {response.status_code}"
             )
             return
 
         data = response.json()
 
         await update.message.reply_text(
-            f"🥇 XAU/USD\n\n"
-            f"💰 البيانات المستلمة:\n"
+            "🥇 XAUUSD - اختبار مصدر البيانات\n\n"
+            f"📊 البيانات المستلمة:\n"
             f"{data}\n\n"
-            f"✅ الاتصال بمصدر البيانات يعمل."
+            "✅ إذا ظهرت بيانات OHLC، فالمصدر يعمل."
+        )
+
+    except requests.exceptions.Timeout:
+        await update.message.reply_text(
+            "⏳ انتهت مهلة الاتصال بمصدر البيانات."
         )
 
     except Exception as e:
         await update.message.reply_text(
-            "❌ حدث خطأ أثناء جلب السعر.\n"
-            f"التفاصيل: {str(e)}"
+            "❌ حدث خطأ أثناء جلب بيانات XAUUSD:\n\n"
+            f"{str(e)}"
         )
 
 
