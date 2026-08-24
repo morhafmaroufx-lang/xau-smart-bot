@@ -40,28 +40,57 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        url = "https://biquote.io/api/XAUUSD/ohlc?interval=5m&limit=5"
+        intervals = ["5m", "15m", "1h", "4h", "1d"]
 
-        response = requests.get(
-            url,
-            timeout=15
-        )
+        results = []
 
-        if response.status_code != 200:
-            await update.message.reply_text(
-                f"⚠️ مصدر البيانات لم يستجب.\n"
-                f"HTTP: {response.status_code}"
+        for interval in intervals:
+            url = (
+                f"https://biquote.io/api/XAUUSD/ohlc"
+                f"?interval={interval}&limit=5"
             )
-            return
 
-        data = response.json()
+            response = requests.get(
+                url,
+                timeout=15
+            )
 
-        await update.message.reply_text(
-            "🥇 XAUUSD - اختبار مصدر البيانات\n\n"
-            f"📊 البيانات المستلمة:\n"
-            f"{data}\n\n"
-            "✅ إذا ظهرت بيانات OHLC، فالمصدر يعمل."
+            if response.status_code != 200:
+                results.append(
+                    f"❌ {interval}: HTTP {response.status_code}"
+                )
+                continue
+
+            data = response.json()
+
+            bars = data.get("bars", [])
+
+            if not bars:
+                results.append(
+                    f"❌ {interval}: لا توجد شموع"
+                )
+                continue
+
+            last = bars[0]
+
+            results.append(
+                f"✅ {interval}\n"
+                f"Open: {last.get('open')}\n"
+                f"High: {last.get('high')}\n"
+                f"Low: {last.get('low')}\n"
+                f"Close: {last.get('close')}\n"
+                f"Tick Volume: {last.get('tickVolume')}"
+            )
+
+        message = (
+            "🥇 XAUUSD - اختبار الفريمات\n\n"
+            + "\n\n".join(results)
+            + "\n\n"
+            "🎯 إذا ظهرت جميع الفريمات ✅ "
+            "نبدأ ببناء محرك التحليل."
         )
+
+        await update.message.reply_text(message)
 
     except requests.exceptions.Timeout:
         await update.message.reply_text(
@@ -70,10 +99,9 @@ async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         await update.message.reply_text(
-            "❌ حدث خطأ أثناء جلب بيانات XAUUSD:\n\n"
+            "❌ حدث خطأ:\n\n"
             f"{str(e)}"
         )
-
 
 async def weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
