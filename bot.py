@@ -99,6 +99,9 @@ def calculate_atr(
 # =========================
 # Signal Scoring
 # =========================
+# =========================
+# Improved Signal Scoring
+# =========================
 
 def calculate_signal_score(
     price,
@@ -113,49 +116,159 @@ def calculate_signal_score(
 ):
     bullish = 0
     bearish = 0
+    warnings = []
 
-    # EMA - 30 points
+    # =========================
+    # EMA TREND - 30 points
+    # =========================
+
     if price > ema20 > ema50 > ema200:
         bullish += 30
+
     elif price < ema20 < ema50 < ema200:
         bearish += 30
 
+    else:
+        # Partial trend
+        if price > ema20:
+            bullish += 10
+
+        elif price < ema20:
+            bearish += 10
+
+    # =========================
     # RSI - 20 points
-    if 50 < rsi < 70:
+    # =========================
+
+    if 50 <= rsi < 70:
         bullish += 20
+
     elif 30 < rsi < 50:
         bearish += 20
 
+    elif rsi >= 70:
+        warnings.append("⚠️ RSI تشبع شرائي")
+
+    elif rsi <= 30:
+        warnings.append("⚠️ RSI تشبع بيعي")
+
+    # =========================
     # MACD - 30 points
+    # =========================
+
     if macd > signal:
         bullish += 30
+
     elif macd < signal:
         bearish += 30
 
-    # Volume - 20 points
-    if average_volume > 0:
-        volume_ratio = tick_volume / average_volume
+    # =========================
+    # VOLUME - 20 points
+    # =========================
 
-        if volume_ratio >= 1.2:
+    volume_confirmed = False
+
+    if average_volume > 0:
+
+        volume_ratio = (
+            tick_volume / average_volume
+        )
+
+        if volume_ratio >= 1.20:
+
+            volume_confirmed = True
+
             if bullish > bearish:
                 bullish += 20
+
             elif bearish > bullish:
                 bearish += 20
 
-    total = bullish + bearish
-
-    if total == 0:
-        return "WAIT", 0
+    # =========================
+    # Determine Signal
+    # =========================
 
     if bullish > bearish:
-        confidence = (bullish / 100) * 100
-        return "BUY", round(confidence)
 
-    if bearish > bullish:
-        confidence = (bearish / 100) * 100
-        return "SELL", round(confidence)
+        signal_type = "BUY"
 
-    return "WAIT", 50
+        raw_score = bullish
+
+    elif bearish > bullish:
+
+        signal_type = "SELL"
+
+        raw_score = bearish
+
+    else:
+
+        signal_type = "WAIT"
+
+        raw_score = 0
+
+    # =========================
+    # Confidence
+    # =========================
+
+    confidence = min(
+        raw_score,
+        100
+    )
+
+    # =========================
+    # Momentum Conflict
+    # =========================
+
+    if signal_type == "BUY" and macd < signal:
+
+        confidence -= 15
+
+        warnings.append(
+            "⚠️ MACD لا يؤكد الصعود"
+        )
+
+    if signal_type == "SELL" and macd > signal:
+
+        confidence -= 15
+
+        warnings.append(
+            "⚠️ MACD لا يؤكد الهبوط"
+        )
+
+    # =========================
+    # Volume Warning
+    # =========================
+
+    if not volume_confirmed:
+
+        warnings.append(
+            "⚠️ Volume لا يعطي تأكيدًا قويًا"
+        )
+
+    # =========================
+    # Final Confidence
+    # =========================
+
+    confidence = max(
+        0,
+        min(confidence, 100)
+    )
+
+    # إذا كانت الثقة ضعيفة
+    if confidence < 60:
+
+        final_signal = "WAIT"
+
+    else:
+
+        final_signal = signal_type
+
+    return (
+        final_signal,
+        round(confidence),
+        warnings
+    )
+
 @app.route("/")
 def home():
     return "XAU Smart Bot v2 is running!"
