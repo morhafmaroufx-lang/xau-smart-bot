@@ -202,16 +202,176 @@ async def weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📊 التحليل اليومي XAUUSD\n\n"
-        "D1 + H4 + H1\n"
-        "EMA 20/50/200\n"
-        "RSI 14\n"
-        "MACD 8/21/5\n"
-        "ATR 14\n"
-        "Volume\n\n"
-        "⏳ سيتم ربط البيانات الحقيقية في الخطوة التالية."
-    )
+    try:
+        intervals = ["1d", "4h", "1h"]
+        names = {
+            "1d": "D1",
+            "4h": "H4",
+            "1h": "H1"
+        }
+
+        results = []
+
+        for interval in intervals:
+
+            url = (
+                f"https://biquote.io/api/XAUUSD/ohlc"
+                f"?interval={interval}&limit=250"
+            )
+
+            response = requests.get(
+                url,
+                timeout=20
+            )
+
+            if response.status_code != 200:
+                results.append(
+                    f"❌ {names[interval]}: "
+                    f"HTTP {response.status_code}"
+                )
+                continue
+
+            data = response.json()
+            bars = data.get("bars", [])
+
+            if len(bars) < 50:
+                results.append(
+                    f"⚠️ {names[interval]}: "
+                    f"بيانات غير كافية"
+                )
+                continue
+
+            # تحويل البيانات إلى DataFrame
+            df = pd.DataFrame(bars)
+
+            # ترتيب الشموع من الأقدم إلى الأحدث
+            df = df.sort_values("openTime")
+
+            # تحويل الأسعار إلى أرقام
+            df["open"] = pd.to_numeric(df["open"])
+            df["high"] = pd.to_numeric(df["high"])
+            df["low"] = pd.to_numeric(df["low"])
+            df["close"] = pd.to_numeric(df["close"])
+
+            close = df["close"]
+
+            # EMA
+            ema20 = calculate_ema(
+                close,
+                20
+            ).iloc[-1]
+
+            ema50 = calculate_ema(
+                close,
+                50
+            ).iloc[-1]
+
+            ema200 = calculate_ema(
+                close,
+                200
+            ).iloc[-1]
+
+            # RSI
+            rsi = calculate_rsi(
+                close,
+                14
+            ).iloc[-1]
+
+            # MACD
+            macd, signal, histogram = calculate_macd(
+                close,
+                8,
+                21,
+                5
+            )
+
+            macd_value = macd.iloc[-1]
+            signal_value = signal.iloc[-1]
+            histogram_value = histogram.iloc[-1]
+
+            # ATR
+            atr = calculate_atr(
+                df["high"],
+                df["low"],
+                close,
+                14
+            ).iloc[-1]
+
+            current_price = close.iloc[-1]
+
+            # =========================
+            # Trend calculation
+            # =========================
+
+            bullish_points = 0
+            bearish_points = 0
+
+            if current_price > ema20:
+                bullish_points += 1
+            else:
+                bearish_points += 1
+
+            if ema20 > ema50:
+                bullish_points += 1
+            else:
+                bearish_points += 1
+
+            if ema50 > ema200:
+                bullish_points += 1
+            else:
+                bearish_points += 1
+
+            if rsi > 50:
+                bullish_points += 1
+            else:
+                bearish_points += 1
+
+            if macd_value > signal_value:
+                bullish_points += 1
+            else:
+                bearish_points += 1
+
+            if bullish_points > bearish_points:
+                trend = "🟢 صاعد"
+            elif bearish_points > bullish_points:
+                trend = "🔴 هابط"
+            else:
+                trend = "🟡 محايد"
+
+            results.append(
+                f"📊 {names[interval]}\n"
+                f"💰 Price: {current_price:.2f}\n"
+                f"📈 EMA20: {ema20:.2f}\n"
+                f"📈 EMA50: {ema50:.2f}\n"
+                f"📈 EMA200: {ema200:.2f}\n"
+                f"RSI: {rsi:.2f}\n"
+                f"MACD: {macd_value:.4f}\n"
+                f"Signal: {signal_value:.4f}\n"
+                f"ATR: {atr:.2f}\n"
+                f"Trend: {trend}"
+            )
+
+        message = (
+            "🤖 XAU SMART BOT\n\n"
+            "📊 DAILY ANALYSIS\n\n"
+            + "\n\n".join(results)
+            + "\n\n"
+            "🎯 المرحلة التالية:\n"
+            "دمج الفريمات وحساب Confidence %."
+        )
+
+        await update.message.reply_text(message)
+
+    except requests.exceptions.Timeout:
+        await update.message.reply_text(
+            "⏳ انتهت مهلة الاتصال ببيانات الذهب."
+        )
+
+    except Exception as e:
+        await update.message.reply_text(
+            "❌ حدث خطأ في التحليل:\n\n"
+            f"{str(e)}"
+        )
 
 
 async def scalp(update: Update, context: ContextTypes.DEFAULT_TYPE):
