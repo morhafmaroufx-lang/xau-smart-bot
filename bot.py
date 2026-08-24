@@ -11,7 +11,91 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 
 app = Flask(__name__)
+# =========================
+# Technical Indicators
+# =========================
 
+def calculate_ema(series, period):
+    return series.ewm(
+        span=period,
+        adjust=False
+    ).mean()
+
+
+def calculate_rsi(series, period=14):
+    delta = series.diff()
+
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.ewm(
+        alpha=1 / period,
+        adjust=False
+    ).mean()
+
+    avg_loss = loss.ewm(
+        alpha=1 / period,
+        adjust=False
+    ).mean()
+
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+
+    rsi = 100 - (100 / (1 + rs))
+
+    return rsi
+
+
+def calculate_macd(
+    series,
+    fast=8,
+    slow=21,
+    signal=5
+):
+    ema_fast = calculate_ema(
+        series,
+        fast
+    )
+
+    ema_slow = calculate_ema(
+        series,
+        slow
+    )
+
+    macd = ema_fast - ema_slow
+
+    signal_line = calculate_ema(
+        macd,
+        signal
+    )
+
+    histogram = macd - signal_line
+
+    return macd, signal_line, histogram
+
+
+def calculate_atr(
+    high,
+    low,
+    close,
+    period=14
+):
+    previous_close = close.shift(1)
+
+    tr1 = high - low
+    tr2 = (high - previous_close).abs()
+    tr3 = (low - previous_close).abs()
+
+    true_range = pd.concat(
+        [tr1, tr2, tr3],
+        axis=1
+    ).max(axis=1)
+
+    atr = true_range.ewm(
+        alpha=1 / period,
+        adjust=False
+    ).mean()
+
+    return atr
 
 @app.route("/")
 def home():
