@@ -96,7 +96,66 @@ def calculate_atr(
     ).mean()
 
     return atr
+# =========================
+# Signal Scoring
+# =========================
 
+def calculate_signal_score(
+    price,
+    ema20,
+    ema50,
+    ema200,
+    rsi,
+    macd,
+    signal,
+    tick_volume,
+    average_volume
+):
+    bullish = 0
+    bearish = 0
+
+    # EMA - 30 points
+    if price > ema20 > ema50 > ema200:
+        bullish += 30
+    elif price < ema20 < ema50 < ema200:
+        bearish += 30
+
+    # RSI - 20 points
+    if 50 < rsi < 70:
+        bullish += 20
+    elif 30 < rsi < 50:
+        bearish += 20
+
+    # MACD - 30 points
+    if macd > signal:
+        bullish += 30
+    elif macd < signal:
+        bearish += 30
+
+    # Volume - 20 points
+    if average_volume > 0:
+        volume_ratio = tick_volume / average_volume
+
+        if volume_ratio >= 1.2:
+            if bullish > bearish:
+                bullish += 20
+            elif bearish > bullish:
+                bearish += 20
+
+    total = bullish + bearish
+
+    if total == 0:
+        return "WAIT", 0
+
+    if bullish > bearish:
+        confidence = (bullish / 100) * 100
+        return "BUY", round(confidence)
+
+    if bearish > bullish:
+        confidence = (bearish / 100) * 100
+        return "SELL", round(confidence)
+
+    return "WAIT", 50
 @app.route("/")
 def home():
     return "XAU Smart Bot v2 is running!"
