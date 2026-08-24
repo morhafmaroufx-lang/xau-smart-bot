@@ -506,7 +506,7 @@ signal_type, score, warnings = calculate_signal_score(
             # تحويل BUY إلى موجب
             # و SELL إلى سالب
             if signal_type == "BUY":
-                directional_score = score
+                signal_type, score, warnings =
 
             elif signal_type == "SELL":
                 directional_score = -score
