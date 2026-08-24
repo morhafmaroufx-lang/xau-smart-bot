@@ -491,17 +491,16 @@ async def daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # =========================
             # Signal Score
             # =========================
-
-            signal_type, score = calculate_signal_score(
-                current_price,
-                ema20,
-                ema50,
-                ema200,
-                rsi,
-                macd_value,
-                signal_value,
-                tick_volume,
-                average_volume
+signal_type, score, warnings = calculate_signal_score(
+    current_price,
+    ema20,
+    ema50,
+    ema200,
+    rsi,
+    macd_value,
+    signal_value,
+    tick_volume,
+    average_volume
             )
 
             # تحويل BUY إلى موجب
@@ -546,7 +545,7 @@ async def daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Trend: {trend}\n"
                 f"Signal: {signal_type}\n"
                 f"Score: {score}%"
-            )
+            )f"\n⚠️ {' | '.join(warnings) if warnings else 'لا توجد تحذيرات'}"
 
         # =========================
         # Multi-Timeframe Result
