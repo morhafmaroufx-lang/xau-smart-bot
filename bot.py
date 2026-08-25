@@ -15,23 +15,77 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 # =========================================================
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
-
-DATA_URL = "https://biquote.io/api/XAUUSD/ohlc"
+BASE_URL = "https://biquote.io/api/XAUUSD/ohlc"
 
 app = Flask(__name__)
 
 
 # =========================================================
-# DATA HELPERS
+# INDICATORS
+# =========================================================
+
+def calculate_ema(series, period):
+    return series.ewm(span=period, adjust=False).mean()
+
+
+def calculate_rsi(series, period=14):
+    delta = series.diff()
+
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.ewm(
+        alpha=1 / period,
+        adjust=False
+    ).mean()
+
+    avg_loss = loss.ewm(
+        alpha=1 / period,
+        adjust=False
+    ).mean()
+
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+
+    return 100 - (100 / (1 + rs))
+
+
+def calculate_macd(series, fast=8, slow=21, signal=5):
+    ema_fast = calculate_ema(series, fast)
+    ema_slow = calculate_ema(series, slow)
+
+    macd = ema_fast - ema_slow
+    signal_line = calculate_ema(macd, signal)
+    histogram = macd - signal_line
+
+    return macd, signal_line, histogram
+
+
+def calculate_atr(high, low, close, period=14):
+    previous_close = close.shift(1)
+
+    tr1 = high - low
+    tr2 = (high - previous_close).abs()
+    tr3 = (low - previous_close).abs()
+
+    true_range = pd.concat(
+        [tr1, tr2, tr3],
+        axis=1
+    ).max(axis=1)
+
+    return true_range.ewm(
+        alpha=1 / period,
+        adjust=False
+    ).mean()
+
+
+# =========================================================
+# DATA
 # =========================================================
 
 def get_bars(interval, limit=250):
-    """
-    جلب بيانات XAUUSD ومعالجتها بشكل آمن.
-    """
 
     response = requests.get(
-        DATA_URL,
+        BASE_URL,
         params={
             "interval": interval,
             "limit": limit
@@ -42,7 +96,6 @@ def get_bars(interval, limit=250):
     response.raise_for_status()
 
     data = response.json()
-
     bars = data.get("bars", [])
 
     if not bars:
@@ -64,7 +117,7 @@ def get_bars(interval, limit=250):
 
         if column not in df.columns:
             raise ValueError(
-                f"البيانات ناقصة: {column}"
+                f"الحقل {column} غير موجود"
             )
 
         df[column] = pd.to_numeric(
@@ -72,452 +125,397 @@ def get_bars(interval, limit=250):
             errors="coerce"
         )
 
-    # -----------------------------------------------------
-    # التاريخ
-    # -----------------------------------------------------
-
-    if "openTime" in df.columns:
-
-        try:
-
-            raw_time = df["openTime"]
-
-            if pd.api.types.is_numeric_dtype(raw_time):
-
-                maximum = raw_time.dropna().max()
-
-                if maximum > 10_000_000_000:
-
-                    df["datetime"] = pd.to_datetime(
-                        raw_time,
-                        unit="ms",
-                        errors="coerce",
-                        utc=True
-                    )
-
-                elif maximum > 10_000_000:
-
-                    df["datetime"] = pd.to_datetime(
-                        raw_time,
-                        unit="s",
-                        errors="coerce",
-                        utc=True
-                    )
-
-                else:
-
-                    df["datetime"] = pd.to_datetime(
-                        raw_time,
-                        errors="coerce",
-                        utc=True
-                    )
-
-            else:
-
-                df["datetime"] = pd.to_datetime(
-                    raw_time,
-                    errors="coerce",
-                    utc=True
-                )
-
-        except Exception:
-
-            df["datetime"] = pd.NaT
-
-    else:
-
-        df["datetime"] = pd.NaT
-
-    # -----------------------------------------------------
-    # ترتيب البيانات
-    # -----------------------------------------------------
-
-    if df["datetime"].notna().sum() > 0:
-
-        df = df.sort_values(
-            "datetime"
-        )
-
-    else:
-
-        df = df.iloc[::-1]
-
     df = df.dropna(
-        subset=[
-            "open",
-            "high",
-            "low",
-            "close",
-            "tickVolume"
-        ]
-    )
-
-    df = df.reset_index(
-        drop=True
+        subset=required
     )
 
     return df
 
 
-def get_live_price():
-    """
-    السعر الحالي من آخر شمعة M5.
-    """
+def sort_bars(df):
 
-    df = get_bars(
-        "5m",
-        5
-    )
+    if "openTime" in df.columns:
 
-    return float(
-        df["close"].iloc[-1]
-    )
+        numeric_time = pd.to_numeric(
+            df["openTime"],
+            errors="coerce"
+        )
+
+        if numeric_time.notna().sum() > 0:
+            df = df.assign(
+                _sort_time=numeric_time
+            ).sort_values(
+                "_sort_time"
+            ).drop(
+                columns=["_sort_time"]
+            )
+
+        else:
+            try:
+                parsed = pd.to_datetime(
+                    df["openTime"],
+                    errors="coerce",
+                    utc=True
+                )
+
+                if parsed.notna().sum() > 0:
+                    df = df.assign(
+                        _sort_time=parsed
+                    ).sort_values(
+                        "_sort_time"
+                    ).drop(
+                        columns=["_sort_time"]
+                    )
+            except Exception:
+                pass
+
+    return df.reset_index(drop=True)
 
 
 # =========================================================
 # WEEKLY BUILDER
 # =========================================================
 
-def build_weekly_from_daily(daily_df):
+def build_weekly_from_daily(df):
 
-    """
-    بناء W1 من D1 بطريقة آمنة.
+    if "openTime" not in df.columns:
+        raise ValueError(
+            "بيانات D1 لا تحتوي على openTime"
+        )
 
-    إذا كانت التواريخ غير متاحة:
-    لا ينهار البوت، وإنما يعيد None.
-    """
+    raw = df["openTime"]
 
-    if "datetime" not in daily_df.columns:
-
-        return None
-
-    valid = daily_df[
-        daily_df["datetime"].notna()
-    ].copy()
-
-    if len(valid) < 2:
-
-        return None
-
-    valid = valid.set_index(
-        "datetime"
+    numeric = pd.to_numeric(
+        raw,
+        errors="coerce"
     )
 
-    weekly = valid.resample(
-        "W-FRI"
-    ).agg({
-
-        "open": "first",
-
-        "high": "max",
-
-        "low": "min",
-
-        "close": "last",
-
-        "tickVolume": "sum"
-
-    })
-
-    weekly = weekly.dropna(
-        subset=[
-            "open",
-            "high",
-            "low",
-            "close"
-        ]
+    dates = pd.Series(
+        pd.NaT,
+        index=df.index,
+        dtype="datetime64[ns, UTC]"
     )
 
-    weekly = weekly.reset_index()
+    numeric_mask = numeric.notna()
+
+    if numeric_mask.any():
+
+        values = numeric[numeric_mask]
+
+        # يدعم seconds / milliseconds / microseconds
+        median_value = values.abs().median()
+
+        if median_value > 1e17:
+            unit = "ns"
+        elif median_value > 1e14:
+            unit = "us"
+        elif median_value > 1e11:
+            unit = "ms"
+        else:
+            unit = "s"
+
+        dates.loc[numeric_mask] = pd.to_datetime(
+            values,
+            unit=unit,
+            errors="coerce",
+            utc=True
+        )
+
+    text_mask = dates.isna()
+
+    if text_mask.any():
+
+        parsed = pd.to_datetime(
+            raw[text_mask],
+            errors="coerce",
+            utc=True
+        )
+
+        dates.loc[text_mask] = parsed
+
+    if dates.notna().sum() < 10:
+        raise ValueError(
+            "تعذر قراءة تواريخ D1 لبناء W1"
+        )
+
+    work = df.copy()
+    work["_date"] = dates
+
+    work = work.dropna(
+        subset=["_date"]
+    )
+
+    work = work.sort_values(
+        "_date"
+    )
+
+    work["_week"] = (
+        work["_date"]
+        .dt.to_period("W-SUN")
+        .dt.start_time
+    )
+
+    weekly = work.groupby(
+        "_week",
+        sort=True
+    ).agg(
+        open=("open", "first"),
+        high=("high", "max"),
+        low=("low", "min"),
+        close=("close", "last"),
+        tickVolume=("tickVolume", "sum")
+    ).reset_index()
+
+    weekly.rename(
+        columns={"_week": "openTime"},
+        inplace=True
+    )
 
     return weekly
 
 
+def get_weekly():
+
+    # نحاول أولاً الحصول على W1 مباشرة
+    try:
+
+        df = get_bars(
+            "1w",
+            250
+        )
+
+        if len(df) >= 10:
+            return sort_bars(df)
+
+    except Exception:
+        pass
+
+    # fallback: بناء W1 من D1
+    daily = get_bars(
+        "1d",
+        500
+    )
+
+    return build_weekly_from_daily(
+        daily
+    )
+
+
 # =========================================================
-# INDICATORS
+# ANALYSIS ENGINE
 # =========================================================
 
-def calculate_ema(series, period):
-
-    return series.ewm(
-        span=period,
-        adjust=False
-    ).mean()
-
-
-def calculate_rsi(series, period=14):
-
-    delta = series.diff()
-
-    gain = delta.clip(
-        lower=0
-    )
-
-    loss = -delta.clip(
-        upper=0
-    )
-
-    avg_gain = gain.ewm(
-        alpha=1 / period,
-        adjust=False
-    ).mean()
-
-    avg_loss = loss.ewm(
-        alpha=1 / period,
-        adjust=False
-    ).mean()
-
-    rs = avg_gain / avg_loss.replace(
-        0,
-        np.nan
-    )
-
-    rsi = 100 - (
-        100 / (1 + rs)
-    )
-
-    return rsi
-
-
-def calculate_macd(
-    series,
-    fast=8,
-    slow=21,
-    signal=5
+def analyze_frame(
+    df,
+    ema_fast=20,
+    ema_slow=50,
+    ema_long=200,
+    rsi_period=14,
+    macd_fast=8,
+    macd_slow=21,
+    macd_signal=5,
+    use_long_ema=True
 ):
 
-    ema_fast = calculate_ema(
-        series,
-        fast
+    df = sort_bars(df)
+
+    close = df["close"]
+
+    price = float(
+        close.iloc[-1]
     )
 
-    ema_slow = calculate_ema(
-        series,
-        slow
+    ema_fast_value = float(
+        calculate_ema(
+            close,
+            ema_fast
+        ).iloc[-1]
     )
 
-    macd = ema_fast - ema_slow
-
-    signal_line = calculate_ema(
-        macd,
-        signal
+    ema_slow_value = float(
+        calculate_ema(
+            close,
+            ema_slow
+        ).iloc[-1]
     )
 
-    histogram = (
-        macd - signal_line
+    ema_long_value = None
+
+    if use_long_ema and len(df) >= ema_long:
+
+        ema_long_value = float(
+            calculate_ema(
+                close,
+                ema_long
+            ).iloc[-1]
+        )
+
+    rsi = float(
+        calculate_rsi(
+            close,
+            rsi_period
+        ).iloc[-1]
     )
 
-    return (
-        macd,
-        signal_line,
-        histogram
+    macd, signal, histogram = calculate_macd(
+        close,
+        macd_fast,
+        macd_slow,
+        macd_signal
     )
 
-
-def calculate_atr(
-    high,
-    low,
-    close,
-    period=14
-):
-
-    previous_close = close.shift(1)
-
-    tr1 = high - low
-
-    tr2 = (
-        high - previous_close
-    ).abs()
-
-    tr3 = (
-        low - previous_close
-    ).abs()
-
-    true_range = pd.concat(
-        [
-            tr1,
-            tr2,
-            tr3
-        ],
-        axis=1
-    ).max(axis=1)
-
-    atr = true_range.ewm(
-        alpha=1 / period,
-        adjust=False
-    ).mean()
-
-    return atr
-
-
-# =========================================================
-# VOLUME RATIO
-# =========================================================
-
-def calculate_volume_ratio(
-    volume_series
-):
-
-    if len(volume_series) < 6:
-
-        return 0.0
-
-    current = float(
-        volume_series.iloc[-1]
+    macd_value = float(
+        macd.iloc[-1]
     )
 
-    # نستبعد الشمعة الحالية من المتوسط
-    previous = volume_series.iloc[
-        -21:-1
-    ]
-
-    if len(previous) == 0:
-
-        previous = volume_series.iloc[
-            :-1
-        ]
-
-    average = float(
-        previous.mean()
+    signal_value = float(
+        signal.iloc[-1]
     )
 
-    if average <= 0:
+    atr = float(
+        calculate_atr(
+            df["high"],
+            df["low"],
+            close,
+            14
+        ).iloc[-1]
+    )
 
-        return 0.0
+    volume = float(
+        df["tickVolume"].iloc[-1]
+    )
 
-    return current / average
+    average_volume = float(
+        df["tickVolume"]
+        .tail(20)
+        .mean()
+    )
 
+    volume_ratio = (
+        volume / average_volume
+        if average_volume > 0
+        else 0
+    )
 
-# =========================================================
-# GENERAL SCORING ENGINE
-# =========================================================
+    # -----------------------------------------------------
+    # TREND
+    # -----------------------------------------------------
 
-def calculate_signal_score(
-    price,
-    ema20,
-    ema50,
-    ema200,
-    rsi,
-    macd,
-    signal,
-    volume_ratio
-):
+    if ema_long_value is not None:
+
+        if price > ema_fast_value > ema_slow_value > ema_long_value:
+            trend = "🟢 صاعد قوي"
+
+        elif price < ema_fast_value < ema_slow_value < ema_long_value:
+            trend = "🔴 هابط قوي"
+
+        elif price > ema_fast_value > ema_slow_value:
+            trend = "🟢 صاعد"
+
+        elif price < ema_fast_value < ema_slow_value:
+            trend = "🔴 هابط"
+
+        else:
+            trend = "🟡 متذبذب"
+
+    else:
+
+        if price > ema_fast_value > ema_slow_value:
+            trend = "🟢 صاعد"
+
+        elif price < ema_fast_value < ema_slow_value:
+            trend = "🔴 هابط"
+
+        else:
+            trend = "🟡 متذبذب"
+
+    # -----------------------------------------------------
+    # SCORE
+    # -----------------------------------------------------
 
     bullish = 0
     bearish = 0
-
     warnings = []
 
-    # -----------------------------------------------------
-    # EMA TREND
-    # -----------------------------------------------------
-
-    if (
-        ema200 is not None
-        and price > ema20 > ema50 > ema200
-    ):
-
-        bullish += 40
-
-    elif (
-        ema200 is not None
-        and price < ema20 < ema50 < ema200
-    ):
-
-        bearish += 40
-
-    elif price > ema20 > ema50:
-
+    # EMA
+    if price > ema_fast_value > ema_slow_value:
         bullish += 30
 
-    elif price < ema20 < ema50:
-
+    elif price < ema_fast_value < ema_slow_value:
         bearish += 30
 
-    elif price > ema20:
+    elif price > ema_fast_value:
+        bullish += 15
 
-        bullish += 20
+    elif price < ema_fast_value:
+        bearish += 15
 
-    elif price < ema20:
+    if ema_long_value is not None:
 
-        bearish += 20
+        if price > ema_long_value:
+            bullish += 10
 
-    # -----------------------------------------------------
+        elif price < ema_long_value:
+            bearish += 10
+
+    else:
+
+        warnings.append(
+            "ℹ️ EMA200 غير مستخدم: التاريخ غير كافٍ"
+        )
+
     # RSI
-    # -----------------------------------------------------
-
     if 50 <= rsi < 70:
-
         bullish += 15
 
     elif 30 < rsi < 50:
-
         bearish += 15
 
     elif rsi >= 70:
+
+        if bullish >= bearish:
+            bullish += 5
 
         warnings.append(
             "⚠️ RSI مرتفع - احتمال تصحيح"
         )
 
-        if bullish > bearish:
-            bullish += 5
-
     elif rsi <= 30:
+
+        if bearish >= bullish:
+            bearish += 5
 
         warnings.append(
             "⚠️ RSI منخفض - احتمال ارتداد"
         )
 
-        if bearish > bullish:
-            bearish += 5
-
-    # -----------------------------------------------------
     # MACD
-    # -----------------------------------------------------
-
-    if macd > signal:
-
+    if macd_value > signal_value:
         bullish += 25
 
-    elif macd < signal:
-
+    elif macd_value < signal_value:
         bearish += 25
 
-    # -----------------------------------------------------
-    # MACD CONFLICT
-    # -----------------------------------------------------
-
-    if (
-        bullish > bearish
-        and macd < signal
-    ):
+    # MACD conflict
+    if bullish > bearish and macd_value < signal_value:
 
         warnings.append(
             "⚠️ MACD لا يؤكد الصعود"
         )
 
-    if (
-        bearish > bullish
-        and macd > signal
-    ):
+    if bearish > bullish and macd_value > signal_value:
 
         warnings.append(
             "⚠️ MACD لا يؤكد الهبوط"
         )
 
-    # -----------------------------------------------------
-    # VOLUME
-    # -----------------------------------------------------
-
+    # Volume
     if volume_ratio >= 1.20:
 
         if bullish > bearish:
-
             bullish += 20
 
         elif bearish > bullish:
-
             bearish += 20
 
     else:
@@ -526,57 +524,309 @@ def calculate_signal_score(
             "ℹ️ Volume ضعيف"
         )
 
-    # -----------------------------------------------------
-    # FINAL DIRECTION
-    # -----------------------------------------------------
-
+    # Direction
     if bullish > bearish:
 
         direction = "BUY"
-
         score = bullish
 
     elif bearish > bullish:
 
         direction = "SELL"
-
         score = bearish
 
     else:
 
         direction = "WAIT"
-
         score = 0
 
-    score = max(
-        0,
-        min(
-            score,
-            100
+    score = int(
+        max(
+            0,
+            min(score, 100)
         )
     )
 
-    # -----------------------------------------------------
-    # SIGNAL LEVEL
-    # -----------------------------------------------------
+    # Price extension
+    extension = False
 
-    if score >= 70:
+    if ema_fast_value != 0:
 
-        signal = direction
+        extension_percent = (
+            abs(price - ema_fast_value)
+            / ema_fast_value
+            * 100
+        )
 
-    elif score >= 50:
+        if extension_percent >= 0.35:
+            extension = True
 
-        signal = "WATCH"
+    return {
+        "price": price,
+        "ema_fast": ema_fast_value,
+        "ema_slow": ema_slow_value,
+        "ema_long": ema_long_value,
+        "rsi": rsi,
+        "macd": macd_value,
+        "signal": signal_value,
+        "atr": atr,
+        "volume": volume,
+        "volume_ratio": volume_ratio,
+        "trend": trend,
+        "direction": direction,
+        "score": score,
+        "warnings": warnings,
+        "extension": extension
+    }
+
+
+# =========================================================
+# DISPLAY
+# =========================================================
+
+def format_frame(name, result):
+
+    warning_text = ""
+
+    if result["warnings"]:
+
+        warning_text = (
+            "\nWarnings:\n"
+            + "\n".join(
+                result["warnings"]
+            )
+        )
+
+    return (
+        f"📊 {name}\n"
+        f"Trend: {result['trend']}\n"
+        f"Direction: "
+        f"{'🟢 BUY' if result['direction'] == 'BUY' else '🔴 SELL' if result['direction'] == 'SELL' else '🟡 WAIT'}\n"
+        f"Score: {result['score']}%"
+        f"{warning_text}"
+    )
+
+
+def agreement(results):
+
+    buys = sum(
+        1 for r in results
+        if r["direction"] == "BUY"
+    )
+
+    sells = sum(
+        1 for r in results
+        if r["direction"] == "SELL"
+    )
+
+    total = len(results)
+
+    return (
+        f"🟢 BUY: {buys}/{total} | "
+        f"🔴 SELL: {sells}/{total}"
+    )
+
+
+def final_direction(results):
+
+    if not results:
+        return "WAIT", 0
+
+    buy_scores = [
+        r["score"]
+        for r in results
+        if r["direction"] == "BUY"
+    ]
+
+    sell_scores = [
+        r["score"]
+        for r in results
+        if r["direction"] == "SELL"
+    ]
+
+    buy_avg = (
+        sum(buy_scores) / len(buy_scores)
+        if buy_scores else 0
+    )
+
+    sell_avg = (
+        sum(sell_scores) / len(sell_scores)
+        if sell_scores else 0
+    )
+
+    buy_count = len(buy_scores)
+    sell_count = len(sell_scores)
+
+    if buy_count > sell_count:
+        direction = "BUY"
+        confidence = buy_avg * (
+            buy_count / len(results)
+        )
+
+    elif sell_count > buy_count:
+        direction = "SELL"
+        confidence = sell_avg * (
+            sell_count / len(results)
+        )
+
+    else:
+        return "WAIT", 0
+
+    confidence = int(
+        round(
+            min(
+                confidence,
+                100
+            )
+        )
+    )
+
+    return direction, confidence
+
+
+def final_label(direction, confidence):
+
+    if direction == "BUY":
+
+        if confidence >= 70:
+            return "🟢 BUY"
+
+        if confidence >= 50:
+            return "🟡 WATCH BUY"
+
+    if direction == "SELL":
+
+        if confidence >= 70:
+            return "🔴 SELL"
+
+        if confidence >= 50:
+            return "🟡 WATCH SELL"
+
+    return "🟡 WAIT"
+
+
+# =========================================================
+# SUMMARY
+# =========================================================
+
+def create_summary(
+    results,
+    mode="normal"
+):
+
+    direction, confidence = final_direction(
+        results
+    )
+
+    all_warnings = []
+
+    for result in results:
+        all_warnings.extend(
+            result["warnings"]
+        )
+
+    has_extension = any(
+        r["extension"]
+        for r in results
+    )
+
+    macd_conflict = any(
+        "MACD لا يؤكد" in w
+        for w in all_warnings
+    )
+
+    volume_weak = any(
+        "Volume ضعيف" in w
+        for w in all_warnings
+    )
+
+    if direction == "BUY":
+
+        if has_extension:
+
+            text = (
+                "الاتجاه العام صاعد، "
+                "لكن السعر ممتد. "
+                "الأفضل انتظار تصحيح "
+                "وتأكيد قبل الدخول."
+            )
+
+            decision = (
+                "⏳ انتظار تصحيح وتأكيد"
+            )
+
+        elif macd_conflict or volume_weak:
+
+            text = (
+                "الاتجاه صاعد، لكن "
+                "التأكيد غير مكتمل."
+            )
+
+            decision = (
+                "⏳ انتظار تأكيد أفضل"
+            )
+
+        else:
+
+            text = (
+                "الاتجاه الصاعد متوافق "
+                "والشروط جيدة."
+            )
+
+            decision = (
+                "🟢 يمكن مراقبة دخول BUY"
+            )
+
+    elif direction == "SELL":
+
+        if has_extension:
+
+            text = (
+                "الاتجاه هابط، لكن السعر "
+                "ممتد. الأفضل انتظار "
+                "تصحيح قبل البيع."
+            )
+
+            decision = (
+                "⏳ انتظار تصحيح وتأكيد"
+            )
+
+        elif macd_conflict or volume_weak:
+
+            text = (
+                "الاتجاه هابط، لكن "
+                "التأكيد غير مكتمل."
+            )
+
+            decision = (
+                "⏳ انتظار تأكيد أفضل"
+            )
+
+        else:
+
+            text = (
+                "الاتجاه الهابط متوافق "
+                "والشروط جيدة."
+            )
+
+            decision = (
+                "🔴 يمكن مراقبة دخول SELL"
+            )
 
     else:
 
-        signal = "WAIT"
+        text = (
+            "الفريمات غير متوافقة "
+            "بشكل كافٍ."
+        )
+
+        decision = (
+            "⏳ انتظار"
+        )
 
     return (
-        signal,
-        direction,
-        round(score),
-        warnings
+        f"🧠 الخلاصة:\n{text}\n\n"
+        f"🎯 القرار:\n{decision}"
     )
 
 
@@ -584,14 +834,12 @@ def calculate_signal_score(
 # START
 # =========================================================
 
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+async def start(update, context):
 
     await update.message.reply_text(
 
-        "🤖 XAU SMART BOT v8\n"
+        "🤖 XAU SMART TRADER v9\n\n"
+
         "🟢 البوت يعمل بنجاح\n\n"
 
         "━━━━━━━━━━━━━━━━━━\n"
@@ -608,6 +856,13 @@ async def start(
         "التحليل اللحظي\n\n"
 
         "━━━━━━━━━━━━━━━━━━\n"
+        "🎯 التداول\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+
+        "🎯 /trade\n"
+        "أريد صفقة\n\n"
+
+        "━━━━━━━━━━━━━━━━━━\n"
         "💰 الأدوات\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
 
@@ -618,8 +873,8 @@ async def start(
         "حالة البوت\n\n"
 
         "━━━━━━━━━━━━━━━━━━\n"
-        "🎯 اختر التحليل الذي تريده."
 
+        "🎯 اختر ما تريد."
     )
 
 
@@ -627,28 +882,23 @@ async def start(
 # STATUS
 # =========================================================
 
-async def status(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+async def status(update, context):
 
     await update.message.reply_text(
 
-        "🟢 XAU Smart Bot v8 يعمل\n\n"
+        "🟢 XAU Smart Bot v9 يعمل\n\n"
 
         "📈 السوق: XAUUSD\n"
         "🤖 النظام: Multi-Timeframe Analysis\n\n"
 
         "📅 Weekly: ON\n"
         "📊 Daily: ON\n"
-        "⚡ Scalp: ON\n\n"
-
-        "🎯 Entry Filter: ON\n"
+        "⚡ Scalp: ON\n"
+        "🎯 Trade Filter: ON\n"
         "🛡️ ATR Risk Filter: ON\n"
         "🔒 المؤشرات التفصيلية: مخفية\n\n"
 
         "⏳ الحالة: تشغيل مباشر"
-
     )
 
 
@@ -656,10 +906,7 @@ async def status(
 # PRICE
 # =========================================================
 
-async def price(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+async def price(update, context):
 
     try:
 
@@ -673,454 +920,78 @@ async def price(
 
         results = []
 
-        live_price = get_live_price()
+        live_price = None
 
         for interval, name in intervals:
 
-            try:
-
-                df = get_bars(
-                    interval,
-                    5
-                )
-
-                last = df.iloc[-1]
-
-                results.append(
-
-                    f"✅ {name}\n"
-                    f"Open: {last['open']:.2f}\n"
-                    f"High: {last['high']:.2f}\n"
-                    f"Low: {last['low']:.2f}\n"
-                    f"Close: {last['close']:.2f}\n"
-                    f"Volume: {last['tickVolume']:.0f}"
-
-                )
-
-            except Exception as e:
-
-                results.append(
-                    f"❌ {name}: {str(e)}"
-                )
-
-        # -------------------------------------------------
-        # WEEKLY DATA
-        # -------------------------------------------------
-
-        try:
-
-            d1 = get_bars(
-                "1d",
-                250
+            df = get_bars(
+                interval,
+                5
             )
 
-            w1 = build_weekly_from_daily(
-                d1
+            df = sort_bars(df)
+
+            last = df.iloc[-1]
+
+            live_price = float(
+                last["close"]
             )
-
-            if w1 is not None and len(w1) > 0:
-
-                last_w = w1.iloc[-1]
-
-                results.append(
-
-                    "📅 W1\n"
-                    f"Open: {last_w['open']:.2f}\n"
-                    f"High: {last_w['high']:.2f}\n"
-                    f"Low: {last_w['low']:.2f}\n"
-                    f"Close: {last_w['close']:.2f}\n"
-                    f"Volume: {last_w['tickVolume']:.0f}"
-
-                )
-
-            else:
-
-                results.append(
-                    "⚠️ W1: تعذر بناء البيانات الأسبوعية"
-                )
-
-        except Exception:
 
             results.append(
-                "⚠️ W1: تعذر بناء البيانات الأسبوعية"
+
+                f"✅ {name}\n"
+                f"Open: {last['open']:.2f}\n"
+                f"High: {last['high']:.2f}\n"
+                f"Low: {last['low']:.2f}\n"
+                f"Close: {last['close']:.2f}\n"
+                f"Volume: {last['tickVolume']:.0f}"
+            )
+
+        # W1
+        try:
+
+            weekly = get_weekly()
+
+            last = weekly.iloc[-1]
+
+            results.append(
+
+                "📅 W1\n"
+                f"Open: {last['open']:.2f}\n"
+                f"High: {last['high']:.2f}\n"
+                f"Low: {last['low']:.2f}\n"
+                f"Close: {last['close']:.2f}\n"
+                f"Volume: {last['tickVolume']:.0f}"
+            )
+
+        except Exception as e:
+
+            results.append(
+                "⚠️ W1\n"
+                f"تعذر البناء: {str(e)}"
             )
 
         message = (
 
-            "🥇 XAUUSD DATA TEST v8\n\n"
+            "🥇 XAUUSD DATA TEST v9\n\n"
 
             f"💰 LIVE PRICE: "
             f"{live_price:.2f}\n\n"
 
             + "\n\n".join(results)
 
-            + "\n\n"
-
-            "🟢 إذا ظهرت الفريمات بنجاح "
-            "فمصدر البيانات يعمل."
-
+            + "\n\n🟢 مصدر البيانات يعمل."
         )
 
         await update.message.reply_text(
             message
         )
 
-    except requests.exceptions.Timeout:
-
-        await update.message.reply_text(
-            "⏳ انتهت مهلة الاتصال بمصدر البيانات."
-        )
-
     except Exception as e:
 
         await update.message.reply_text(
-            f"❌ خطأ في اختبار البيانات:\n{str(e)}"
-        )
-
-
-# =========================================================
-# ANALYSIS ENGINE
-# =========================================================
-
-def analyze_dataframe(
-    df,
-    mode="normal"
-):
-
-    if len(df) < 50:
-
-        raise ValueError(
-            f"بيانات غير كافية: {len(df)} شمعة"
-        )
-
-    close = df["close"]
-
-    # -----------------------------------------------------
-    # EMA
-    # -----------------------------------------------------
-
-    ema20 = calculate_ema(
-        close,
-        20
-    ).iloc[-1]
-
-    ema50 = calculate_ema(
-        close,
-        50
-    ).iloc[-1]
-
-    ema200 = None
-
-    if len(df) >= 220:
-
-        ema200 = calculate_ema(
-            close,
-            200
-        ).iloc[-1]
-
-    # -----------------------------------------------------
-    # RSI
-    # -----------------------------------------------------
-
-    rsi_period = 9 if mode == "scalp" else 14
-
-    rsi = calculate_rsi(
-        close,
-        rsi_period
-    ).iloc[-1]
-
-    # -----------------------------------------------------
-    # MACD
-    # -----------------------------------------------------
-
-    if mode == "scalp":
-
-        macd, signal, _ = calculate_macd(
-            close,
-            5,
-            13,
-            4
-        )
-
-    else:
-
-        macd, signal, _ = calculate_macd(
-            close,
-            8,
-            21,
-            5
-        )
-
-    macd_value = macd.iloc[-1]
-
-    signal_value = signal.iloc[-1]
-
-    # -----------------------------------------------------
-    # ATR
-    # -----------------------------------------------------
-
-    atr = calculate_atr(
-        df["high"],
-        df["low"],
-        close,
-        14
-    ).iloc[-1]
-
-    price = float(
-        close.iloc[-1]
-    )
-
-    volume_ratio = calculate_volume_ratio(
-        df["tickVolume"]
-    )
-
-    return {
-        "price": price,
-        "ema20": float(ema20),
-        "ema50": float(ema50),
-        "ema200": (
-            float(ema200)
-            if ema200 is not None
-            else None
-        ),
-        "rsi": float(rsi),
-        "macd": float(macd_value),
-        "signal": float(signal_value),
-        "atr": float(atr),
-        "volume_ratio": float(volume_ratio)
-    }
-
-
-# =========================================================
-# TREND
-# =========================================================
-
-def determine_trend(
-    data
-):
-
-    price = data["price"]
-
-    ema20 = data["ema20"]
-
-    ema50 = data["ema50"]
-
-    ema200 = data["ema200"]
-
-    if (
-        ema200 is not None
-        and price > ema20 > ema50 > ema200
-    ):
-
-        return "🟢 صاعد قوي"
-
-    if (
-        price > ema20
-        and ema20 > ema50
-    ):
-
-        return "🟢 صاعد"
-
-    if (
-        ema200 is not None
-        and price < ema20 < ema50 < ema200
-    ):
-
-        return "🔴 هابط قوي"
-
-    if (
-        price < ema20
-        and ema20 < ema50
-    ):
-
-        return "🔴 هابط"
-
-    return "🟡 متذبذب"
-
-
-# =========================================================
-# DAILY
-# =========================================================
-
-async def daily(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    try:
-
-        config = [
-            ("1d", "D1", 0.40),
-            ("4h", "H4", 0.35),
-            ("1h", "H1", 0.25)
-        ]
-
-        results = []
-
-        weighted = []
-
-        buy_count = 0
-
-        sell_count = 0
-
-        for interval, name, weight in config:
-
-            try:
-
-                df = get_bars(
-                    interval,
-                    250
-                )
-
-                data = analyze_dataframe(
-                    df,
-                    "normal"
-                )
-
-                signal, direction, score, warnings = (
-                    calculate_signal_score(
-                        data["price"],
-                        data["ema20"],
-                        data["ema50"],
-                        data["ema200"],
-                        data["rsi"],
-                        data["macd"],
-                        data["signal"],
-                        data["volume_ratio"]
-                    )
-                )
-
-                trend = determine_trend(
-                    data
-                )
-
-                if direction == "BUY":
-
-                    directional = score
-                    buy_count += 1
-
-                elif direction == "SELL":
-
-                    directional = -score
-                    sell_count += 1
-
-                else:
-
-                    directional = 0
-
-                weighted.append(
-                    directional * weight
-                )
-
-                warning_text = (
-                    " | ".join(warnings)
-                    if warnings
-                    else "لا توجد تحذيرات"
-                )
-
-                results.append(
-
-                    f"📊 {name}\n"
-                    f"Trend: {trend}\n"
-                    f"Direction: {direction}\n"
-                    f"Score: {score}%\n"
-                    f"⚠️ {warning_text}"
-
-                )
-
-            except Exception as e:
-
-                results.append(
-
-                    f"⚠️ {name}\n"
-                    f"تعذر تحليل الفريم"
-
-                )
-
-        # -------------------------------------------------
-        # FINAL
-        # -------------------------------------------------
-
-        if not weighted:
-
-            raise ValueError(
-                "تعذر تحليل الفريمات."
-            )
-
-        final_score = sum(
-            weighted
-        )
-
-        confidence = round(
-            min(
-                abs(final_score),
-                100
-            )
-        )
-
-        if final_score >= 65:
-
-            final_signal = "🟢 BUY"
-
-        elif final_score >= 45:
-
-            final_signal = "🟡 WATCH BUY"
-
-        elif final_score <= -65:
-
-            final_signal = "🔴 SELL"
-
-        elif final_score <= -45:
-
-            final_signal = "🟠 WATCH SELL"
-
-        else:
-
-            final_signal = "🟡 WAIT"
-
-        message = (
-
-            "🤖 XAU SMART BOT v8\n"
-            "📊 DAILY ANALYSIS\n\n"
-
-            + "\n\n".join(results)
-
-            + "\n\n"
-
-            "━━━━━━━━━━━━━━━━━━\n"
-
-            f"🎯 FINAL SIGNAL: "
-            f"{final_signal}\n"
-
-            f"💪 CONFIDENCE: "
-            f"{confidence}%\n"
-
-            f"📊 AGREEMENT: "
-            f"🟢 BUY {buy_count}/3 | "
-            f"🔴 SELL {sell_count}/3\n"
-
-            "━━━━━━━━━━━━━━━━━━\n\n"
-
-            "🔒 المؤشرات التفصيلية مخفية\n"
-            "⚠️ Confidence = توافق الإشارات "
-            "وليس احتمال الربح."
-
-        )
-
-        await update.message.reply_text(
-            message
-        )
-
-    except requests.exceptions.Timeout:
-
-        await update.message.reply_text(
-            "⏳ انتهت مهلة الاتصال ببيانات الذهب."
-        )
-
-    except Exception as e:
-
-        await update.message.reply_text(
-            f"❌ خطأ في التحليل اليومي:\n{str(e)}"
+            "❌ خطأ في بيانات السعر:\n"
+            f"{str(e)}"
         )
 
 
@@ -1128,204 +999,199 @@ async def daily(
 # WEEKLY
 # =========================================================
 
-async def weekly(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+async def weekly(update, context):
 
     try:
 
-        # -------------------------------------------------
-        # D1 → W1
-        # -------------------------------------------------
-
-        d1 = get_bars(
-            "1d",
-            250
-        )
-
-        w1 = build_weekly_from_daily(
-            d1
-        )
-
-        if w1 is None or len(w1) < 20:
-
-            raise ValueError(
-                "بيانات W1 غير كافية."
-            )
-
-        config = [
-            ("W1", w1, 0.50),
-            ("D1", d1, 0.30),
-            ("H4", get_bars("4h", 250), 0.20)
+        frames = [
+            ("W1", get_weekly()),
+            ("D1", get_bars("1d", 300)),
+            ("H4", get_bars("4h", 300))
         ]
 
         results = []
 
-        weighted = []
+        for name, df in frames:
 
-        buy_count = 0
-
-        sell_count = 0
-
-        for name, df, weight in config:
-
-            try:
-
-                # W1 لا يحتاج EMA200 إذا لم تتوفر
-                data = analyze_dataframe(
-                    df,
-                    "normal"
-                )
-
-                signal, direction, score, warnings = (
-                    calculate_signal_score(
-                        data["price"],
-                        data["ema20"],
-                        data["ema50"],
-                        data["ema200"],
-                        data["rsi"],
-                        data["macd"],
-                        data["signal"],
-                        data["volume_ratio"]
-                    )
-                )
-
-                trend = determine_trend(
-                    data
-                )
-
-                if (
-                    name == "W1"
-                    and data["ema200"] is None
-                ):
-
-                    warnings.append(
-                        "ℹ️ EMA200 الأسبوعي غير متاح "
-                        "بسبب نقص التاريخ"
-                    )
-
-                if direction == "BUY":
-
-                    weighted.append(
-                        score * weight
-                    )
-
-                    buy_count += 1
-
-                elif direction == "SELL":
-
-                    weighted.append(
-                        -score * weight
-                    )
-
-                    sell_count += 1
-
-                else:
-
-                    weighted.append(
-                        0
-                    )
-
-                warning_text = (
-                    " | ".join(warnings)
-                    if warnings
-                    else "لا توجد تحذيرات"
-                )
-
-                results.append(
-
-                    f"📊 {name}\n"
-                    f"Trend: {trend}\n"
-                    f"Direction: {direction}\n"
-                    f"Score: {score}%\n"
-                    f"⚠️ {warning_text}"
-
-                )
-
-            except Exception:
-
-                results.append(
-
-                    f"⚠️ {name}\n"
-                    f"تعذر تحليل الفريم"
-
-                )
-
-        final_score = sum(
-            weighted
-        )
-
-        confidence = round(
-            min(
-                abs(final_score),
-                100
+            result = analyze_frame(
+                df,
+                20,
+                50,
+                200,
+                14,
+                8,
+                21,
+                5
             )
+
+            results.append(
+                (name, result)
+            )
+
+        only_results = [
+            r for _, r in results
+        ]
+
+        direction, confidence = final_direction(
+            only_results
         )
 
-        if final_score >= 65:
+        output = [
+            "🤖 XAU SMART TRADER v9",
+            "📅 WEEKLY ANALYSIS",
+            ""
+        ]
 
-            final_signal = "🟢 BUY"
+        for name, result in results:
 
-        elif final_score >= 45:
+            output.append(
+                format_frame(
+                    name,
+                    result
+                )
+            )
 
-            final_signal = "🟡 WATCH BUY"
+            output.append("")
 
-        elif final_score <= -65:
+        output.extend([
 
-            final_signal = "🔴 SELL"
-
-        elif final_score <= -45:
-
-            final_signal = "🟠 WATCH SELL"
-
-        else:
-
-            final_signal = "🟡 WAIT"
-
-        message = (
-
-            "🤖 XAU SMART BOT v8\n"
-            "📅 WEEKLY ANALYSIS\n\n"
-
-            + "\n\n".join(results)
-
-            + "\n\n"
-
-            "━━━━━━━━━━━━━━━━━━\n"
+            "━━━━━━━━━━━━━━━━━━",
 
             f"🎯 FINAL WEEKLY: "
-            f"{final_signal}\n"
+            f"{final_label(direction, confidence)}",
 
             f"💪 CONFIDENCE: "
-            f"{confidence}%\n"
+            f"{confidence}%",
 
             f"📊 AGREEMENT: "
-            f"🟢 BUY {buy_count}/3 | "
-            f"🔴 SELL {sell_count}/3\n"
+            f"{agreement(only_results)}",
 
-            "━━━━━━━━━━━━━━━━━━\n\n"
+            "",
 
-            "🔒 المؤشرات التفصيلية مخفية\n"
-            "⚠️ Confidence = توافق الإشارات "
-            "وليس احتمال الربح."
+            create_summary(
+                only_results,
+                "weekly"
+            ),
 
-        )
+            "",
+
+            "━━━━━━━━━━━━━━━━━━",
+
+            "🔒 المؤشرات التفصيلية مخفية",
+
+            "⚠️ Confidence = توافق الإشارات وليس احتمال الربح."
+
+        ])
 
         await update.message.reply_text(
-            message
-        )
-
-    except requests.exceptions.Timeout:
-
-        await update.message.reply_text(
-            "⏳ انتهت مهلة بيانات التحليل الأسبوعي."
+            "\n".join(output)
         )
 
     except Exception as e:
 
         await update.message.reply_text(
-            f"❌ خطأ في التحليل الأسبوعي:\n{str(e)}"
+            "❌ خطأ في التحليل الأسبوعي:\n"
+            f"{str(e)}"
+        )
+
+
+# =========================================================
+# DAILY
+# =========================================================
+
+async def daily(update, context):
+
+    try:
+
+        frames = [
+            ("D1", get_bars("1d", 300)),
+            ("H4", get_bars("4h", 300)),
+            ("H1", get_bars("1h", 300))
+        ]
+
+        results = []
+
+        for name, df in frames:
+
+            result = analyze_frame(
+                df,
+                20,
+                50,
+                200,
+                14,
+                8,
+                21,
+                5
+            )
+
+            results.append(
+                (name, result)
+            )
+
+        only_results = [
+            r for _, r in results
+        ]
+
+        direction, confidence = final_direction(
+            only_results
+        )
+
+        output = [
+            "🤖 XAU SMART TRADER v9",
+            "📊 DAILY ANALYSIS",
+            ""
+        ]
+
+        for name, result in results:
+
+            output.append(
+                format_frame(
+                    name,
+                    result
+                )
+            )
+
+            output.append("")
+
+        output.extend([
+
+            "━━━━━━━━━━━━━━━━━━",
+
+            f"🎯 FINAL SIGNAL: "
+            f"{final_label(direction, confidence)}",
+
+            f"💪 CONFIDENCE: "
+            f"{confidence}%",
+
+            f"📊 AGREEMENT: "
+            f"{agreement(only_results)}",
+
+            "",
+
+            create_summary(
+                only_results,
+                "daily"
+            ),
+
+            "",
+
+            "━━━━━━━━━━━━━━━━━━",
+
+            "🔒 المؤشرات التفصيلية مخفية",
+
+            "⚠️ Confidence = توافق الإشارات وليس احتمال الربح."
+
+        ])
+
+        await update.message.reply_text(
+            "\n".join(output)
+        )
+
+    except Exception as e:
+
+        await update.message.reply_text(
+            "❌ خطأ في التحليل اليومي:\n"
+            f"{str(e)}"
         )
 
 
@@ -1333,591 +1199,365 @@ async def weekly(
 # SCALP
 # =========================================================
 
-def scalp_score(
-    data
-):
-
-    bullish = 0
-    bearish = 0
-
-    warnings = []
-
-    price = data["price"]
-
-    ema9 = data["ema9"]
-
-    ema20 = data["ema20"]
-
-    ema50 = data["ema50"]
-
-    rsi = data["rsi"]
-
-    macd = data["macd"]
-
-    signal = data["signal"]
-
-    volume_ratio = data["volume_ratio"]
-
-    atr = data["atr"]
-
-    # -----------------------------------------------------
-    # TREND
-    # -----------------------------------------------------
-
-    if price > ema9 > ema20 > ema50:
-
-        bullish += 40
-
-    elif price < ema9 < ema20 < ema50:
-
-        bearish += 40
-
-    elif price > ema20 > ema50:
-
-        bullish += 30
-
-    elif price < ema20 < ema50:
-
-        bearish += 30
-
-    elif price > ema20:
-
-        bullish += 20
-
-    elif price < ema20:
-
-        bearish += 20
-
-    # -----------------------------------------------------
-    # RSI
-    # -----------------------------------------------------
-
-    if 50 <= rsi < 70:
-
-        bullish += 15
-
-    elif 30 < rsi < 50:
-
-        bearish += 15
-
-    elif rsi >= 80:
-
-        warnings.append(
-            "⚠️ RSI تشبع شرائي قوي"
-        )
-
-    elif rsi >= 70:
-
-        warnings.append(
-            "⚠️ RSI مرتفع - لا نطارد السعر"
-        )
-
-    elif rsi <= 20:
-
-        warnings.append(
-            "⚠️ RSI تشبع بيعي قوي"
-        )
-
-    elif rsi <= 30:
-
-        warnings.append(
-            "⚠️ RSI منخفض"
-        )
-
-    # -----------------------------------------------------
-    # MACD
-    # -----------------------------------------------------
-
-    if macd > signal:
-
-        bullish += 25
-
-    elif macd < signal:
-
-        bearish += 25
-
-    # -----------------------------------------------------
-    # VOLUME
-    # -----------------------------------------------------
-
-    if volume_ratio >= 1.20:
-
-        if bullish > bearish:
-
-            bullish += 20
-
-        elif bearish > bullish:
-
-            bearish += 20
-
-    else:
-
-        warnings.append(
-            "⚠️ Volume ضعيف"
-        )
-
-    # -----------------------------------------------------
-    # DIRECTION
-    # -----------------------------------------------------
-
-    if bullish > bearish:
-
-        direction = "BUY"
-        score = bullish
-
-    elif bearish > bullish:
-
-        direction = "SELL"
-        score = bearish
-
-    else:
-
-        direction = "WAIT"
-        score = 0
-
-    # -----------------------------------------------------
-    # PRICE EXTENSION
-    # -----------------------------------------------------
-
-    extension = abs(
-        price - ema20
-    )
-
-    if atr > 0:
-
-        extension_ratio = (
-            extension / atr
-        )
-
-        if extension_ratio >= 0.80:
-
-            warnings.append(
-                "⚠️ السعر ممتد عن EMA20"
-            )
-
-    # -----------------------------------------------------
-    # SCORE
-    # -----------------------------------------------------
-
-    score = max(
-        0,
-        min(
-            score,
-            100
-        )
-    )
-
-    return (
-        direction,
-        round(score),
-        warnings
-    )
-
-
-async def scalp(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+async def scalp(update, context):
 
     try:
 
-        config = [
-            ("1h", "H1"),
-            ("15m", "M15"),
-            ("5m", "M5")
+        frames = [
+            ("H1", get_bars("1h", 250)),
+            ("M15", get_bars("15m", 250)),
+            ("M5", get_bars("5m", 250))
         ]
 
         results = []
 
-        directional_scores = []
+        for name, df in frames:
 
-        buy_count = 0
+            result = analyze_frame(
+                df,
+                9,
+                20,
+                50,
+                9,
+                5,
+                13,
+                4,
+                use_long_ema=False
+            )
 
-        sell_count = 0
+            results.append(
+                (name, result)
+            )
 
-        all_warnings = []
-
-        scalp_data = {}
-
-        for interval, name in config:
-
-            try:
-
-                df = get_bars(
-                    interval,
-                    250
-                )
-
-                if len(df) < 60:
-
-                    raise ValueError(
-                        "بيانات غير كافية"
-                    )
-
-                close = df["close"]
-
-                ema9 = calculate_ema(
-                    close,
-                    9
-                ).iloc[-1]
-
-                ema20 = calculate_ema(
-                    close,
-                    20
-                ).iloc[-1]
-
-                ema50 = calculate_ema(
-                    close,
-                    50
-                ).iloc[-1]
-
-                rsi = calculate_rsi(
-                    close,
-                    9
-                ).iloc[-1]
-
-                macd, signal, _ = (
-                    calculate_macd(
-                        close,
-                        5,
-                        13,
-                        4
-                    )
-                )
-
-                atr = calculate_atr(
-                    df["high"],
-                    df["low"],
-                    close,
-                    14
-                ).iloc[-1]
-
-                data = {
-
-                    "price": float(
-                        close.iloc[-1]
-                    ),
-
-                    "ema9": float(
-                        ema9
-                    ),
-
-                    "ema20": float(
-                        ema20
-                    ),
-
-                    "ema50": float(
-                        ema50
-                    ),
-
-                    "rsi": float(
-                        rsi
-                    ),
-
-                    "macd": float(
-                        macd.iloc[-1]
-                    ),
-
-                    "signal": float(
-                        signal.iloc[-1]
-                    ),
-
-                    "atr": float(
-                        atr
-                    ),
-
-                    "volume_ratio":
-                        calculate_volume_ratio(
-                            df["tickVolume"]
-                        )
-
-                }
-
-                direction, score, warnings = (
-                    scalp_score(
-                        data
-                    )
-                )
-
-                scalp_data[name] = data
-
-                if direction == "BUY":
-
-                    directional_scores.append(
-                        score
-                    )
-
-                    buy_count += 1
-
-                elif direction == "SELL":
-
-                    directional_scores.append(
-                        -score
-                    )
-
-                    sell_count += 1
-
-                else:
-
-                    directional_scores.append(
-                        0
-                    )
-
-                all_warnings.extend(
-                    warnings
-                )
-
-                trend = "🟢 صاعد"
-
-                if (
-                    data["price"]
-                    < data["ema20"]
-                    < data["ema50"]
-                ):
-
-                    trend = "🔴 هابط"
-
-                elif not (
-                    data["price"]
-                    > data["ema20"]
-                    > data["ema50"]
-                ):
-
-                    trend = "🟡 متذبذب"
-
-                warning_text = (
-                    " | ".join(warnings)
-                    if warnings
-                    else "لا توجد تحذيرات"
-                )
-
-                results.append(
-
-                    f"📊 {name}\n"
-                    f"Trend: {trend}\n"
-                    f"Direction: {direction}\n"
-                    f"Score: {score}%\n"
-                    f"⚠️ {warning_text}"
-
-                )
-
-            except Exception:
-
-                results.append(
-
-                    f"⚠️ {name}\n"
-                    "تعذر تحليل الفريم"
-
-                )
-
-        # -------------------------------------------------
-        # FINAL SCALP
-        # -------------------------------------------------
-
-        valid_scores = [
-            x for x in directional_scores
-            if x != 0
+        only_results = [
+            r for _, r in results
         ]
 
-        if not valid_scores:
+        direction, confidence = final_direction(
+            only_results
+        )
 
-            final_signal = "🟡 WAIT"
+        output = [
+            "🤖 XAU SMART TRADER v9",
+            "⚡ SCALP ANALYSIS",
+            ""
+        ]
 
-            confidence = 0
+        for name, result in results:
 
-            final_direction = "WAIT"
+            output.append(
+                format_frame(
+                    name,
+                    result
+                )
+            )
+
+            output.append("")
+
+        # Entry decision
+        all_same = (
+            len(only_results) == 3
+            and all(
+                r["direction"] == direction
+                for r in only_results
+            )
+        )
+
+        strong_entry = (
+            all_same
+            and confidence >= 70
+            and not any(
+                r["extension"]
+                for r in only_results
+            )
+        )
+
+        output.extend([
+            "━━━━━━━━━━━━━━━━━━",
+            f"🎯 FINAL SCALP: "
+            f"{final_label(direction, confidence)}",
+            f"💪 CONFIDENCE: {confidence}%",
+            f"📊 AGREEMENT: {agreement(only_results)}",
+        ])
+
+        if strong_entry:
+
+            output.extend([
+                "",
+                "🟢 Entry متاح",
+                "🎯 يمكن مراقبة الدخول مع تأكيد السعر.",
+                "",
+                create_summary(
+                    only_results,
+                    "scalp"
+                )
+            ])
 
         else:
 
-            average_score = (
-                sum(valid_scores)
-                / len(valid_scores)
-            )
+            output.extend([
+                "",
+                "⏳ Entry Filter: ON",
+                "🚫 لا يوجد Entry حاليًا.",
+                "",
+                "⏳ القرار:",
+                "انتظار تصحيح أو تأكيد أفضل."
+            ])
 
-            confidence = round(
-                abs(average_score)
-            )
-
-            if buy_count > sell_count:
-
-                final_direction = "BUY"
-
-            elif sell_count > buy_count:
-
-                final_direction = "SELL"
-
-            else:
-
-                final_direction = "WAIT"
-
-            # -------------------------------------------------
-            # ENTRY FILTER
-            # -------------------------------------------------
-
-            entry_allowed = True
-
-            m5 = scalp_data.get(
-                "M5"
-            )
-
-            m15 = scalp_data.get(
-                "M15"
-            )
-
-            if m5 and m15:
-
-                # تمدد قوي
-                if (
-                    m5["price"] > m5["ema20"]
-                    and
-                    (
-                        m5["price"]
-                        - m5["ema20"]
-                    )
-                    >
-                    m5["atr"] * 0.80
-                ):
-
-                    entry_allowed = False
-
-                # RSI شديد الارتفاع
-                if (
-                    final_direction == "BUY"
-                    and m5["rsi"] >= 80
-                ):
-
-                    entry_allowed = False
-
-                # RSI شديد الانخفاض
-                if (
-                    final_direction == "SELL"
-                    and m5["rsi"] <= 20
-                ):
-
-                    entry_allowed = False
-
-            if (
-                final_direction == "BUY"
-                and confidence >= 70
-                and entry_allowed
-            ):
-
-                final_signal = "🟢 BUY"
-
-            elif (
-                final_direction == "SELL"
-                and confidence >= 70
-                and entry_allowed
-            ):
-
-                final_signal = "🔴 SELL"
-
-            elif (
-                final_direction == "BUY"
-                and confidence >= 50
-            ):
-
-                final_signal = "🟡 WATCH BUY"
-
-            elif (
-                final_direction == "SELL"
-                and confidence >= 50
-            ):
-
-                final_signal = "🟠 WATCH SELL"
-
-            else:
-
-                final_signal = "🟡 WAIT"
-
-        # -------------------------------------------------
-        # ENTRY DECISION
-        # -------------------------------------------------
-
-        entry_text = (
-            "🚫 لا يوجد Entry حاليًا."
-        )
-
-        if final_signal == "🟢 BUY":
-
-            entry_text = (
-                "🎯 Entry: متاح بعد تأكيد شمعة الدخول"
-            )
-
-        elif final_signal == "🔴 SELL":
-
-            entry_text = (
-                "🎯 Entry: متاح بعد تأكيد شمعة الدخول"
-            )
-
-        elif "WATCH" in final_signal:
-
-            entry_text = (
-                "⏳ Entry Filter: انتظار تصحيح "
-                "أو تأكيد أفضل"
-            )
-
-        # إزالة التحذيرات المكررة
-        unique_warnings = list(
-            dict.fromkeys(
-                all_warnings
-            )
-        )
-
-        warning_text = (
-            " | ".join(
-                unique_warnings
-            )
-            if unique_warnings
-            else "لا توجد تحذيرات"
-        )
-
-        message = (
-
-            "🤖 XAU SMART BOT v8\n"
-            "⚡ SCALP ANALYSIS\n\n"
-
-            + "\n\n".join(results)
-
-            + "\n\n"
-
-            "━━━━━━━━━━━━━━━━━━\n"
-
-            f"🎯 FINAL SCALP: "
-            f"{final_signal}\n"
-
-            f"💪 CONFIDENCE: "
-            f"{confidence}%\n"
-
-            f"📊 AGREEMENT: "
-            f"🟢 BUY {buy_count}/3 | "
-            f"🔴 SELL {sell_count}/3\n\n"
-
-            f"{entry_text}\n\n"
-
-            f"⚠️ {warning_text}\n"
-
-            "━━━━━━━━━━━━━━━━━━\n\n"
-
-            "🔒 المؤشرات التفصيلية مخفية\n"
+        output.extend([
+            "",
+            "━━━━━━━━━━━━━━━━━━",
+            "🔒 المؤشرات التفصيلية مخفية",
             "⚠️ التحليل اللحظي لا يضمن الربح."
-
-        )
-
-        await update.message.reply_text(
-            message
-        )
-
-    except requests.exceptions.Timeout:
+        ])
 
         await update.message.reply_text(
-            "⏳ انتهت مهلة بيانات التحليل اللحظي."
+            "\n".join(output)
         )
 
     except Exception as e:
 
         await update.message.reply_text(
-            f"❌ خطأ في التحليل اللحظي:\n{str(e)}"
+            "❌ خطأ في التحليل اللحظي:\n"
+            f"{str(e)}"
+        )
+
+
+# =========================================================
+# TRADE — أريد صفقة
+# =========================================================
+
+async def trade(update, context):
+
+    try:
+
+        frames = [
+            ("H1", get_bars("1h", 250)),
+            ("M15", get_bars("15m", 250)),
+            ("M5", get_bars("5m", 250))
+        ]
+
+        results = []
+
+        for name, df in frames:
+
+            result = analyze_frame(
+                df,
+                9,
+                20,
+                50,
+                9,
+                5,
+                13,
+                4,
+                use_long_ema=False
+            )
+
+            results.append(
+                (name, result)
+            )
+
+        only_results = [
+            r for _, r in results
+        ]
+
+        direction, confidence = final_direction(
+            only_results
+        )
+
+        same_direction = (
+            len(only_results) == 3
+            and all(
+                r["direction"] == direction
+                for r in only_results
+            )
+        )
+
+        extension = any(
+            r["extension"]
+            for r in only_results
+        )
+
+        weak_volume = any(
+            r["volume_ratio"] < 0.80
+            for r in only_results
+        )
+
+        # شروط الصفقة
+        trade_available = (
+            direction in ["BUY", "SELL"]
+            and same_direction
+            and confidence >= 70
+            and not extension
+        )
+
+        # السعر الحالي
+        price = only_results[-1]["price"]
+
+        atr = only_results[-1]["atr"]
+
+        # =================================================
+        # TRADE AVAILABLE
+        # =================================================
+
+        if trade_available:
+
+            if direction == "BUY":
+
+                entry_low = price - atr * 0.15
+                entry_high = price + atr * 0.05
+
+                sl = entry_low - atr * 0.80
+
+                risk = entry_high - sl
+
+                tp1 = entry_high + risk * 1.25
+                tp2 = entry_high + risk * 2.00
+
+                side = "🟢 BUY"
+
+            else:
+
+                entry_high = price + atr * 0.15
+                entry_low = price - atr * 0.05
+
+                sl = entry_high + atr * 0.80
+
+                risk = sl - entry_low
+
+                tp1 = entry_low - risk * 1.25
+                tp2 = entry_low - risk * 2.00
+
+                side = "🔴 SELL"
+
+            output = [
+
+                "🤖 XAU SMART TRADER v9",
+                "",
+                "🎯 صفقة متاحة",
+                "",
+                f"{side} XAUUSD",
+                "",
+                f"📍 Entry: "
+                f"{entry_low:.2f} - {entry_high:.2f}",
+
+                f"🛑 SL: {sl:.2f}",
+
+                f"🎯 TP1: {tp1:.2f}",
+
+                f"🎯 TP2: {tp2:.2f}",
+
+                "",
+                f"💪 Confidence: {confidence}%",
+
+                f"📊 Agreement: "
+                f"{agreement(only_results)}",
+
+                "",
+                "🧠 الخلاصة:",
+
+                "الفريمات متوافقة "
+                "والشروط الحالية تسمح "
+                "بمراقبة دخول.",
+
+                "",
+                "🛡️ استخدم إدارة رأس المال.",
+
+                "",
+                "⚠️ الصفقة إشارة تحليلية "
+                "وليست ضمانًا للربح."
+            ]
+
+        # =================================================
+        # NO TRADE
+        # =================================================
+
+        else:
+
+            reasons = []
+
+            if not same_direction:
+                reasons.append(
+                    "الفريمات غير متوافقة"
+                )
+
+            if confidence < 70:
+                reasons.append(
+                    "قوة الإشارة غير كافية"
+                )
+
+            if extension:
+                reasons.append(
+                    "السعر ممتد عن المتوسط"
+                )
+
+            if weak_volume:
+                reasons.append(
+                    "Volume ضعيف"
+                )
+
+            if not reasons:
+                reasons.append(
+                    "الشروط لم تكتمل"
+                )
+
+            # مدة الانتظار
+            if extension:
+                wait_time = "10–20 دقيقة"
+
+            elif not same_direction:
+                wait_time = "15–30 دقيقة"
+
+            elif weak_volume:
+                wait_time = "10–15 دقيقة"
+
+            else:
+                wait_time = "5–10 دقائق"
+
+            output = [
+
+                "🤖 XAU SMART TRADER v9",
+                "",
+                "⏳ لا توجد صفقة الآن",
+                "",
+                f"📊 الاتجاه الحالي: "
+                f"{'🟢 BUY' if direction == 'BUY' else '🔴 SELL' if direction == 'SELL' else '🟡 WAIT'}",
+
+                f"💪 Confidence: {confidence}%",
+
+                "",
+                "⚠️ السبب:",
+
+                *[
+                    f"• {reason}"
+                    for reason in reasons
+                ],
+
+                "",
+                f"⏱️ إعادة الفحص المقترحة: "
+                f"{wait_time}",
+
+                "",
+                "🎯 القرار:",
+
+                "⏳ انتظار اكتمال الشروط.",
+
+                "",
+                "🚫 لا تطارد السعر.",
+
+                "",
+                "🔒 المؤشرات التفصيلية مخفية."
+            ]
+
+        await update.message.reply_text(
+            "\n".join(output)
+        )
+
+    except Exception as e:
+
+        await update.message.reply_text(
+            "❌ خطأ في البحث عن صفقة:\n"
+            f"{str(e)}"
         )
 
 
@@ -1928,26 +1568,11 @@ async def scalp(
 @app.route("/")
 def home():
 
-    return "XAU Smart Bot v8 is running!"
-
-
-def run_server():
-
-    port = int(
-        os.environ.get(
-            "PORT",
-            10000
-        )
-    )
-
-    app.run(
-        host="0.0.0.0",
-        port=port
-    )
+    return "XAU Smart Trader v9 is running!"
 
 
 # =========================================================
-# TELEGRAM
+# BOT
 # =========================================================
 
 async def run_bot():
@@ -2006,6 +1631,13 @@ async def run_bot():
         )
     )
 
+    application.add_handler(
+        CommandHandler(
+            "trade",
+            trade
+        )
+    )
+
     await application.initialize()
 
     await application.start()
@@ -2023,10 +1655,27 @@ async def run_bot():
     finally:
 
         await application.updater.stop()
-
         await application.stop()
-
         await application.shutdown()
+
+
+# =========================================================
+# SERVER
+# =========================================================
+
+def run_server():
+
+    port = int(
+        os.environ.get(
+            "PORT",
+            10000
+        )
+    )
+
+    app.run(
+        host="0.0.0.0",
+        port=port
+    )
 
 
 # =========================================================
@@ -2040,7 +1689,6 @@ def main():
     )
 
     server.daemon = True
-
     server.start()
 
     asyncio.run(
@@ -2049,5 +1697,4 @@ def main():
 
 
 if __name__ == "__main__":
-
     main()
