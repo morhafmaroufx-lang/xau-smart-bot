@@ -1635,7 +1635,64 @@ async def status(
         message
     )
 
+# =========================================================
+# FINAL DECISION ENGINE
+# =========================================================
 
+def calculate_final(results):
+    buy_score = 0.0
+    sell_score = 0.0
+
+    buy_count = 0
+    sell_count = 0
+
+    for result, weight in results:
+
+        direction = result.get("direction", "")
+        score = float(result.get("score", 0))
+
+        if "BUY" in direction:
+            buy_score += score * weight
+            buy_count += 1
+
+        elif "SELL" in direction:
+            sell_score += score * weight
+            sell_count += 1
+
+    final_score = buy_score - sell_score
+
+    confidence = int(
+        min(
+            abs(final_score),
+            100
+        )
+    )
+
+    if final_score >= 60:
+        signal = "🟢 شراء"
+
+    elif final_score <= -60:
+        signal = "🔴 بيع"
+
+    else:
+        signal = "🟡 انتظار"
+
+    if buy_score > sell_score:
+        bias = "🟢 صاعد"
+
+    elif sell_score > buy_score:
+        bias = "🔴 هابط"
+
+    else:
+        bias = "🟡 متذبذب"
+
+    return (
+        signal,
+        confidence,
+        buy_count,
+        sell_count,
+        bias
+    )
 # =========================================================
 # DAILY ANALYSIS
 # =========================================================
