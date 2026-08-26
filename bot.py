@@ -312,6 +312,90 @@ def cmc_confirmation(_df, _direction):
 # CORE ANALYSIS
 # =========================================================
 
+
+def advanced_structure(df, lookback=20):
+    x = df.tail(min(lookback, len(df)))
+    if len(x) < 8:
+        return {"state": "🟡 غير كافٍ", "score": 0, "break": False}
+    prev = x.iloc[:-1]
+    last = x.iloc[-1]
+    prior_high = safe_float(prev["high"].max())
+    prior_low = safe_float(prev["low"].min())
+    close = safe_float(last["close"])
+    bullish_break = close > prior_high
+    bearish_break = close < prior_low
+    base = structure_state(x)
+    if bullish_break:
+        return {"state": "🟢 BOS صاعد", "score": 12, "break": True, "break_dir": "BUY"}
+    if bearish_break:
+        return {"state": "🔴 BOS هابط", "score": 12, "break": True, "break_dir": "SELL"}
+    if "HH/HL" in base:
+        return {"state": "🟢 HH/HL", "score": 8, "break": False, "break_dir": "BUY"}
+    if "LH/LL" in base:
+        return {"state": "🔴 LH/LL", "score": 8, "break": False, "break_dir": "SELL"}
+    return {"state": "🟡 مختلط", "score": 0, "break": False, "break_dir": "WAIT"}
+
+
+def advanced_liquidity(df, lookback=20):
+    x = df.tail(min(lookback, len(df))).copy()
+    vol = x["tickVolume"].astype(float)
+    current_vol = safe_float(vol.iloc[-1])
+    median_vol = safe_float(vol.median(), 1)
+    ratio = current_vol / median_vol if median_vol > 0 else 0
+    last = x.iloc[-1]
+    prior = x.iloc[:-1]
+    swept_high = safe_float(last["high"]) > safe_float(prior["high"].max()) and safe_float(last["close"]) < safe_float(prior["high"].max())
+    swept_low = safe_float(last["low"]) < safe_float(prior["low"].min()) and safe_float(last["close"]) > safe_float(prior["low"].min())
+    if swept_low and ratio >= 1.10:
+        state = "🟢 سحب سيولة من القاع"
+        bias = "BUY"
+    elif swept_high and ratio >= 1.10:
+        state = "🔴 سحب سيولة من القمة"
+        bias = "SELL"
+    elif ratio >= 1.30:
+        state = "🟢 نشاط سيولة مرتفع"
+        bias = "NEUTRAL"
+    elif ratio >= 0.85:
+        state = "🟡 سيولة طبيعية"
+        bias = "NEUTRAL"
+    else:
+        state = "🔴 سيولة ضعيفة"
+        bias = "NEUTRAL"
+    return {"state": state, "ratio": ratio, "bias": bias, "swept_high": swept_high, "swept_low": swept_low}
+
+
+def advanced_volume(df, lookback=30):
+    x = df.tail(min(lookback, len(df))).copy()
+    v = x["tickVolume"].astype(float)
+    recent = safe_float(v.tail(5).mean())
+    base = safe_float(v.head(max(5, len(v)-5)).mean(), 1)
+    ratio = recent / base if base > 0 else 0
+    last = x.iloc[-1]
+    body = abs(safe_float(last["close"]) - safe_float(last["open"]))
+    rng = max(safe_float(last["high"]) - safe_float(last["low"]), 1e-9)
+    efficiency = body / rng
+    if ratio >= 1.25 and efficiency >= 0.55:
+        state = "🟢 حجم مؤيد للحركة"
+    elif ratio >= 0.95:
+        state = "🟡 حجم طبيعي"
+    else:
+        state = "🔴 حجم غير داعم"
+    return {"state": state, "ratio": ratio, "efficiency": efficiency}
+
+
+def sr_proximity(df, lookback=50):
+    x = df.tail(min(lookback, len(df)))
+    current = safe_float(x["close"].iloc[-1])
+    atr_v = max(safe_float(atr(x["high"], x["low"], x["close"], 14).iloc[-1]), 0.01)
+    supports = [safe_float(v) for v in x["low"] if safe_float(v) < current]
+    resistances = [safe_float(v) for v in x["high"] if safe_float(v) > current]
+    support = max(supports) if supports else current - atr_v
+    resistance = min(resistances) if resistances else current + atr_v
+    near_support = abs(current-support) <= atr_v*0.45
+    near_resistance = abs(resistance-current) <= atr_v*0.45
+    return {"support": support, "resistance": resistance, "near_support": near_support, "near_resistance": near_resistance}
+
+
 def analyze_frame(df, scalp=False):
     if df is None or len(df) < 60:
         raise ValueError("البيانات غير كافية للتحليل")
@@ -347,6 +431,10 @@ def analyze_frame(df, scalp=False):
     liq_state, liq_ratio = liquidity_state(df)
     vol_state, vol_ratio = volume_state(df)
     structure = structure_state(df)
+    advanced_struct = advanced_structure(df)
+    advanced_liq = advanced_liquidity(df)
+    advanced_vol = advanced_volume(df)
+    sr = sr_proximity(df)
     fib = fibonacci_levels(df)
 
     wick = candle_wick_features(df.iloc[-1])
@@ -515,6 +603,10 @@ def analyze_frame(df, scalp=False):
         "volume_state": vol_state,
         "volume_ratio": vol_ratio,
         "structure": structure,
+        "advanced_structure": advanced_struct,
+        "advanced_liquidity": advanced_liq,
+        "advanced_volume": advanced_vol,
+        "sr": sr,
         "wick": wick,
         "wick_bias": wick_bias,
         "fib": fib,
@@ -581,21 +673,13 @@ def build_entry_zone(direction, current, levels, atr_value):
 
 
 def mtf_engine(m15, m5, m1):
-    """MTF scalp engine.
-
-    M15 is the market context, M5 is confirmation/pullback state and M1 is
-    the entry trigger.  A short M5/M1 correction is not allowed to flip a
-    clear M15 trend into the opposite market direction.
-    """
+    """Strict MTF decision layer: context -> confirmation -> trigger."""
     weighted = (
         m15["score"] * 0.45 +
         m5["score"] * 0.35 +
         m1["score"] * 0.20
     )
 
-    # Context comes from the M15 trend first, not from a single short-term
-    # indicator. This is the key protection against "bearish pullback" being
-    # misclassified as a bearish market.
     if m15["trend"] == "🟢 صاعد":
         context = "BUY"
     elif m15["trend"] == "🔴 هابط":
@@ -603,23 +687,9 @@ def mtf_engine(m15, m5, m1):
     else:
         context = m15["direction"] if m15["direction"] in ("BUY", "SELL") else "WAIT"
 
-    m5_dir = m5["direction"]
-    m1_dir = m1["direction"]
-
-    # A counter-direction M5 reading is treated as a pullback when M15
-    # structure still agrees with the larger context.
-    bullish_pullback = (
-        context == "BUY"
-        and m5_dir == "SELL"
-        and m15["structure"] == "🟢 HH/HL"
-        and m5["structure"] != "🔴 LH/LL"
-    )
-    bearish_pullback = (
-        context == "SELL"
-        and m5_dir == "BUY"
-        and m15["structure"] == "🔴 LH/LL"
-        and m5["structure"] != "🟢 HH/HL"
-    )
+    m5_dir, m1_dir = m5["direction"], m1["direction"]
+    bullish_pullback = context == "BUY" and m5_dir == "SELL" and m15["structure"] == "🟢 HH/HL" and m5["structure"] != "🔴 LH/LL"
+    bearish_pullback = context == "SELL" and m5_dir == "BUY" and m15["structure"] == "🔴 LH/LL" and m5["structure"] != "🟢 HH/HL"
 
     if bullish_pullback:
         phase = "🟢 Bullish Pullback"
@@ -634,119 +704,95 @@ def mtf_engine(m15, m5, m1):
     else:
         phase = "🟡 سياق غير واضح"
 
-    # Entry direction requires the M1 trigger to return to the M15 context.
-    # This prevents entering while the correction is still running.
-    if context == "BUY" and m1_dir == "BUY":
-        direction = "BUY"
-    elif context == "SELL" and m1_dir == "SELL":
-        direction = "SELL"
-    else:
-        direction = "WAIT"
-
+    direction = context if context in ("BUY", "SELL") and m1_dir == context else "WAIT"
     conflict = conflict_analysis(direction, context, m5_dir)
 
-    wick_ok = (
-        (context == "BUY" and m15["wick_bias"] == "bullish_rejection") or
-        (context == "SELL" and m15["wick_bias"] == "bearish_rejection")
-    )
+    wick_ok = ((context == "BUY" and m15["wick_bias"] == "bullish_rejection") or
+               (context == "SELL" and m15["wick_bias"] == "bearish_rejection"))
+
+    # Advanced structure/liquidity/volume quality.
+    quality = 0.0
+    for frame, weight in ((m15, 5), (m5, 4), (m1, 2)):
+        ast = frame["advanced_structure"]
+        if ast["break_dir"] == direction:
+            quality += weight
+        elif ast["break_dir"] not in ("WAIT", direction) and direction in ("BUY", "SELL"):
+            quality -= weight * 0.5
 
     if direction == "BUY":
-        if m15["structure"] == "🟢 HH/HL":
-            weighted += 4
-        if m5["structure"] == "🟢 HH/HL":
-            weighted += 3
-        if bullish_pullback:
-            weighted += 5
+        if m15["advanced_liquidity"]["bias"] == "BUY": quality += 5
+        if m5["advanced_liquidity"]["bias"] == "BUY": quality += 4
+        if m1["advanced_liquidity"]["bias"] == "BUY": quality += 2
     elif direction == "SELL":
-        if m15["structure"] == "🔴 LH/LL":
-            weighted += 4
-        if m5["structure"] == "🔴 LH/LL":
-            weighted += 3
-        if bearish_pullback:
-            weighted += 5
+        if m15["advanced_liquidity"]["bias"] == "SELL": quality += 5
+        if m5["advanced_liquidity"]["bias"] == "SELL": quality += 4
+        if m1["advanced_liquidity"]["bias"] == "SELL": quality += 2
+
+    if direction in ("BUY", "SELL"):
+        for frame, w in ((m15, 4), (m5, 3), (m1, 2)):
+            if frame["advanced_volume"]["state"] == "🟢 حجم مؤيد للحركة": quality += w
+            elif frame["advanced_volume"]["state"] == "🔴 حجم غير داعم": quality -= w
 
     if wick_ok:
-        weighted += 3
+        quality += 3
+
+    # S/R adds weight only when price is near the relevant side; it does not
+    # manufacture a signal in the middle of nowhere.
+    if direction == "BUY" and (m5["sr"]["near_support"] or m15["sr"]["near_support"]):
+        quality += 5
+    elif direction == "SELL" and (m5["sr"]["near_resistance"] or m15["sr"]["near_resistance"]):
+        quality += 5
+
+    score = int(max(0, min(round(weighted + quality), 100)))
 
     risk_flags = 0
-    if "🔴" in conflict:
-        risk_flags += 2
-    if m15["liquidity_ratio"] < 0.80:
-        risk_flags += 1
-    if m5["liquidity_ratio"] < 0.80:
-        risk_flags += 1
-    if m1["extended"]:
-        risk_flags += 1
+    if "🔴" in conflict: risk_flags += 2
+    if m15["advanced_liquidity"]["ratio"] < 0.75: risk_flags += 1
+    if m5["advanced_liquidity"]["ratio"] < 0.75: risk_flags += 1
+    if m1["advanced_volume"]["state"] == "🔴 حجم غير داعم": risk_flags += 1
+    if any(x["extended"] for x in (m15, m5, m1)): risk_flags += 1
+    if direction == "BUY" and m15["sr"]["near_resistance"]: risk_flags += 1
+    if direction == "SELL" and m15["sr"]["near_support"]: risk_flags += 1
 
-    risk = "🟢 منخفض"
-    if risk_flags >= 3:
-        risk = "🔴 مرتفع"
-    elif risk_flags >= 1:
-        risk = "🟡 متوسط"
+    risk = "🟢 منخفض" if risk_flags == 0 else "🟡 متوسط" if risk_flags <= 2 else "🔴 مرتفع"
 
-    score = int(max(0, min(round(weighted), 100)))
-
-    # 73% is only a confluence threshold. An actual entry also needs context,
-    # a returned M1 trigger, acceptable risk and sufficient market quality.
     strict_conditions = (
-        direction in ("BUY", "SELL")
-        and score >= TRADE_THRESHOLD
-        and risk != "🔴 مرتفع"
-        and not m1["extended"]
-        and m15["adx"] >= 18
-        and m5["adx"] >= 15
-        and m15["liquidity_ratio"] >= 0.80
-        and m5["liquidity_ratio"] >= 0.80
-        and (m5_dir in (direction, "SELL" if direction == "BUY" else "BUY"))
-        and not (
-            (direction == "BUY" and m5_dir == "SELL" and m5["structure"] == "🔴 LH/LL")
-            or
-            (direction == "SELL" and m5_dir == "BUY" and m5["structure"] == "🟢 HH/HL")
-        )
+        direction in ("BUY", "SELL") and score >= TRADE_THRESHOLD and risk != "🔴 مرتفع" and
+        not any(x["extended"] for x in (m5, m1)) and
+        m15["adx"] >= 18 and m5["adx"] >= 15 and
+        m15["advanced_liquidity"]["ratio"] >= 0.80 and m5["advanced_liquidity"]["ratio"] >= 0.80 and
+        m15["advanced_structure"]["break_dir"] in (direction, "WAIT") and
+        m5["advanced_structure"]["break_dir"] in (direction, "WAIT") and
+        (wick_ok or (m5["advanced_liquidity"]["bias"] == direction and m5["advanced_volume"]["ratio"] >= 1.0))
     )
 
     perfect_conditions = (
-        direction in ("BUY", "SELL")
-        and score >= STRICT_100_THRESHOLD
-        and risk == "🟢 منخفض"
-        and context == direction
-        and m15["direction"] == m5["direction"] == m1["direction"] == direction
-        and not any(x["extended"] for x in (m15, m5, m1))
-        and m15["adx"] >= 25
-        and m5["adx"] >= 20
-        and m1["adx"] >= 15
-        and m15["liquidity_ratio"] >= 1.0
-        and m5["liquidity_ratio"] >= 1.0
-        and wick_ok
+        direction in ("BUY", "SELL") and score >= STRICT_100_THRESHOLD and risk == "🟢 منخفض" and
+        m15["direction"] == m5["direction"] == m1["direction"] == direction and
+        all(not x["extended"] for x in (m15, m5, m1)) and
+        m15["adx"] >= 25 and m5["adx"] >= 20 and m1["adx"] >= 15 and
+        m15["advanced_liquidity"]["ratio"] >= 1.0 and m5["advanced_liquidity"]["ratio"] >= 1.0 and
+        m15["advanced_volume"]["ratio"] >= 1.15 and m5["advanced_volume"]["ratio"] >= 1.10 and
+        wick_ok
     )
 
-    # Secret Scalp is intentionally stricter than the normal 73% gate.
     secret_ready = (
-        strict_conditions
-        and score >= 85
-        and context == direction
-        and m1_dir == direction
-        and (m5_dir == direction or bullish_pullback or bearish_pullback)
-        and m15["structure"] in ("🟢 HH/HL", "🔴 LH/LL")
-        and m5["structure"] in ("🟢 HH/HL", "🔴 LH/LL")
-        and wick_ok
+        strict_conditions and score >= 85 and context == direction and m1_dir == direction and
+        m15["structure"] in ("🟢 HH/HL", "🔴 LH/LL") and
+        m5["structure"] in ("🟢 HH/HL", "🔴 LH/LL") and
+        (wick_ok or m5["advanced_liquidity"]["bias"] == direction)
     )
 
     return {
-        "direction": direction,
-        "context": context,
-        "phase": phase,
-        "score": min(score, 100),
-        "risk": risk,
-        "conflict": conflict,
-        "wick_ok": wick_ok,
-        "bullish_pullback": bullish_pullback,
-        "bearish_pullback": bearish_pullback,
-        "strict_ready": strict_conditions,
-        "secret_ready": secret_ready,
-        "perfect": perfect_conditions,
+        "direction": direction, "context": context, "phase": phase,
+        "score": score, "risk": risk, "conflict": conflict,
+        "wick_ok": wick_ok, "bullish_pullback": bullish_pullback,
+        "bearish_pullback": bearish_pullback, "strict_ready": strict_conditions,
+        "secret_ready": secret_ready, "perfect": perfect_conditions,
+        "structure": m15["advanced_structure"]["state"],
+        "liquidity": m15["advanced_liquidity"]["state"],
+        "volume": m15["advanced_volume"]["state"],
     }
-
 
 def build_trade(direction, df):
     current = safe_float(df["close"].iloc[-1])
