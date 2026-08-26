@@ -703,7 +703,22 @@ def build_trade(direction, df):
         tp2 = entry - atr_v * 2.00
 
     return entry, sl, tp1, tp2, levels
+def direction_ar(direction):
+    return {
+        "BUY": "شراء 🟢",
+        "SELL": "بيع 🔴",
+        "WAIT": "انتظار 🟡"
+    }.get(direction, direction)
 
+
+def confidence_label(score):
+    if score >= 99:
+        return "💯 إشارة صارمة"
+    if score >= 73:
+        return "🎯 دقة عالية"
+    if score >= 65:
+        return "🟡 مراقبة"
+    return "🟠 ضعيفة"
 
 # =========================================================
 # FORMATTING
@@ -976,10 +991,9 @@ async def daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def scalp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await command_lock(update, "scalp"):
         return
-    try:
-        m15_df = get_bars("15m", 300)
-        m5_df = get_bars("5m", 300)
-        m1_df = get_bars("1m", 300)
+    try:f"سياق 15 دقيقة: {direction_ar(m15['direction'])} — {m15['score']}%\n"
+f"تأكيد 5 دقائق: {direction_ar(m5['direction'])} — {m5['score']}%\n"
+f"إشارة 1 دقيقة: {direction_ar(m1['direction'])} — {m1['score']}%\n"
 
         m15, m5, m1 = [analyze_frame(x, scalp=True)
                         for x in (m15_df, m5_df, m1_df)]
