@@ -15,7 +15,7 @@ from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
 # =========================================================
-# XAU SMART TRADER v14.1
+# XAU SMART TRADER v15.1
 # =========================================================
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -68,14 +68,14 @@ WEEKLY_REPORT_WEEK = None
 
 @app.route("/", methods=["GET", "HEAD"])
 def home():
-    return "XAU SMART TRADER v14.1 - OK", 200
+    return "XAU SMART TRADER v15.1 - OK", 200
 
 
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({
         "status": "ok",
-        "bot": "XAU SMART TRADER v14.1",
+        "bot": "XAU SMART TRADER v15.1",
         "time": datetime.now(DAMASCUS).isoformat()
     }), 200
 
@@ -581,39 +581,73 @@ def build_entry_zone(direction, current, levels, atr_value):
 
 
 def mtf_engine(m15, m5, m1):
-    # M15 = context, M5 = confirmation, M1 = trigger.
+    """MTF scalp engine.
+
+    M15 is the market context, M5 is confirmation/pullback state and M1 is
+    the entry trigger.  A short M5/M1 correction is not allowed to flip a
+    clear M15 trend into the opposite market direction.
+    """
     weighted = (
         m15["score"] * 0.45 +
         m5["score"] * 0.35 +
         m1["score"] * 0.20
     )
 
-    bullish = [x["direction"] == "BUY" for x in (m15, m5, m1)]
-    bearish = [x["direction"] == "SELL" for x in (m15, m5, m1)]
+    # Context comes from the M15 trend first, not from a single short-term
+    # indicator. This is the key protection against "bearish pullback" being
+    # misclassified as a bearish market.
+    if m15["trend"] == "🟢 صاعد":
+        context = "BUY"
+    elif m15["trend"] == "🔴 هابط":
+        context = "SELL"
+    else:
+        context = m15["direction"] if m15["direction"] in ("BUY", "SELL") else "WAIT"
 
-    context = m15["direction"]
-    trigger = m1["direction"]
+    m5_dir = m5["direction"]
+    m1_dir = m1["direction"]
 
-    if all(bullish):
+    # A counter-direction M5 reading is treated as a pullback when M15
+    # structure still agrees with the larger context.
+    bullish_pullback = (
+        context == "BUY"
+        and m5_dir == "SELL"
+        and m15["structure"] == "🟢 HH/HL"
+        and m5["structure"] != "🔴 LH/LL"
+    )
+    bearish_pullback = (
+        context == "SELL"
+        and m5_dir == "BUY"
+        and m15["structure"] == "🔴 LH/LL"
+        and m5["structure"] != "🟢 HH/HL"
+    )
+
+    if bullish_pullback:
+        phase = "🟢 Bullish Pullback"
+    elif bearish_pullback:
+        phase = "🔴 Bearish Pullback"
+    elif context == "BUY" and m5_dir == "BUY":
+        phase = "🟢 Bullish Confirmation"
+    elif context == "SELL" and m5_dir == "SELL":
+        phase = "🔴 Bearish Confirmation"
+    elif context in ("BUY", "SELL"):
+        phase = "🟡 تصحيح/تعارض قصير الأجل"
+    else:
+        phase = "🟡 سياق غير واضح"
+
+    # Entry direction requires the M1 trigger to return to the M15 context.
+    # This prevents entering while the correction is still running.
+    if context == "BUY" and m1_dir == "BUY":
         direction = "BUY"
-    elif all(bearish):
-        direction = "SELL"
-    elif context == "BUY" and trigger == "BUY" and m5["direction"] != "SELL":
-        direction = "BUY"
-    elif context == "SELL" and trigger == "SELL" and m5["direction"] != "BUY":
+    elif context == "SELL" and m1_dir == "SELL":
         direction = "SELL"
     else:
         direction = "WAIT"
 
-    conflict = conflict_analysis(
-        direction,
-        context,
-        m5["direction"]
-    )
+    conflict = conflict_analysis(direction, context, m5_dir)
 
     wick_ok = (
-        (direction == "BUY" and m15["wick_bias"] == "bullish_rejection") or
-        (direction == "SELL" and m15["wick_bias"] == "bearish_rejection")
+        (context == "BUY" and m15["wick_bias"] == "bullish_rejection") or
+        (context == "SELL" and m15["wick_bias"] == "bearish_rejection")
     )
 
     if direction == "BUY":
@@ -621,11 +655,15 @@ def mtf_engine(m15, m5, m1):
             weighted += 4
         if m5["structure"] == "🟢 HH/HL":
             weighted += 3
+        if bullish_pullback:
+            weighted += 5
     elif direction == "SELL":
         if m15["structure"] == "🔴 LH/LL":
             weighted += 4
         if m5["structure"] == "🔴 LH/LL":
             weighted += 3
+        if bearish_pullback:
+            weighted += 5
 
     if wick_ok:
         weighted += 3
@@ -648,6 +686,8 @@ def mtf_engine(m15, m5, m1):
 
     score = int(max(0, min(round(weighted), 100)))
 
+    # 73% is only a confluence threshold. An actual entry also needs context,
+    # a returned M1 trigger, acceptable risk and sufficient market quality.
     strict_conditions = (
         direction in ("BUY", "SELL")
         and score >= TRADE_THRESHOLD
@@ -657,29 +697,54 @@ def mtf_engine(m15, m5, m1):
         and m5["adx"] >= 15
         and m15["liquidity_ratio"] >= 0.80
         and m5["liquidity_ratio"] >= 0.80
+        and (m5_dir in (direction, "SELL" if direction == "BUY" else "BUY"))
+        and not (
+            (direction == "BUY" and m5_dir == "SELL" and m5["structure"] == "🔴 LH/LL")
+            or
+            (direction == "SELL" and m5_dir == "BUY" and m5["structure"] == "🟢 HH/HL")
+        )
     )
 
     perfect_conditions = (
         direction in ("BUY", "SELL")
         and score >= STRICT_100_THRESHOLD
         and risk == "🟢 منخفض"
-        and m15["direction"] == m5["direction"] == m1["direction"]
+        and context == direction
+        and m15["direction"] == m5["direction"] == m1["direction"] == direction
         and not any(x["extended"] for x in (m15, m5, m1))
         and m15["adx"] >= 25
         and m5["adx"] >= 20
         and m1["adx"] >= 15
         and m15["liquidity_ratio"] >= 1.0
         and m5["liquidity_ratio"] >= 1.0
+        and wick_ok
+    )
+
+    # Secret Scalp is intentionally stricter than the normal 73% gate.
+    secret_ready = (
+        strict_conditions
+        and score >= 85
+        and context == direction
+        and m1_dir == direction
+        and (m5_dir == direction or bullish_pullback or bearish_pullback)
+        and m15["structure"] in ("🟢 HH/HL", "🔴 LH/LL")
+        and m5["structure"] in ("🟢 HH/HL", "🔴 LH/LL")
+        and wick_ok
     )
 
     return {
         "direction": direction,
+        "context": context,
+        "phase": phase,
         "score": min(score, 100),
         "risk": risk,
         "conflict": conflict,
         "wick_ok": wick_ok,
+        "bullish_pullback": bullish_pullback,
+        "bearish_pullback": bearish_pullback,
         "strict_ready": strict_conditions,
-        "perfect": perfect_conditions
+        "secret_ready": secret_ready,
+        "perfect": perfect_conditions,
     }
 
 
@@ -887,7 +952,7 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     subscribed = update.effective_chat.id in SUBSCRIBERS
     await update.message.reply_text(
-        "🤖 XAU SMART TRADER v14.1\n\n"
+        "🤖 XAU SMART TRADER v15.1\n\n"
         "🟢 النظام: يعمل\n"
         "🌐 Webhook: يعمل\n"
         "📡 البيانات: متاحة\n"
@@ -1031,7 +1096,7 @@ async def scalp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         levels = calculate_support_resistance(m5_df, 80)
 
         await update.message.reply_text(
-            "⚡ XAU SMART TRADER v14.1 — التحليل السريع\n\n"
+            "🕵️ XAU SMART TRADER — Secret Scalp\n\n"
             "📖 قراءة أولية\n"
             f"الاتجاه الحالي: {m15['trend']}\n"
             f"منطقة الاهتمام: دعم {levels['support1']:.2f} / مقاومة {levels['resistance1']:.2f}\n"
@@ -1040,12 +1105,15 @@ async def scalp(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"سياق M15: {m15['direction']} — {m15['score']}%\n"
             f"تأكيد M5: {m5['direction']} — {m5['score']}%\n"
             f"إشارة M1: {m1['direction']} — {m1['score']}%\n\n"
-            f"🎯 النتيجة: {'🟢 شراء' if engine['direction']=='BUY' else '🔴 بيع' if engine['direction']=='SELL' else '🟡 انتظار'}\n"
+            f"🧭 السياق الأكبر M15: {'🟢 صاعد' if engine['context']=='BUY' else '🔴 هابط' if engine['context']=='SELL' else '🟡 غير واضح'}\n"
+            f"🔄 حالة M5: {engine['phase']}\n"
+            f"🎯 Trigger M1: {'🟢 شراء' if engine['direction']=='BUY' else '🔴 بيع' if engine['direction']=='SELL' else '⏳ لم يتأكد'}\n"
             f"💪 التوافق: {engine['score']}%\n"
             f"🛡️ الخطر: {engine['risk']}\n"
             f"🧠 التعارضات: {engine['conflict']}\n"
             f"🕯️ ذيل M15: {'🟢 مؤكد' if engine['wick_ok'] else '🟡 غير مؤكد'}\n\n"
             f"{'🎯 شروط 73% مكتملة' if engine['strict_ready'] else '⏳ لم تكتمل شروط 73%'}\n"
+            f"{'🕵️ Secret Scalp 85%+ جاهز' if engine['secret_ready'] else '🔒 Secret Scalp غير مكتمل'}\n"
             f"{'💯 إشارة 100% صارمة' if engine['perfect'] else '🔒 لا توجد حالة 100% الآن'}"
         )
     except Exception as e:
@@ -1078,7 +1146,7 @@ async def trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
         label = "💯 إشارة صارمة 100%" if engine["perfect"] else "🎯 دقة عالية 73%+"
 
         await update.message.reply_text(
-            "🤖 XAU SMART TRADER v14.1\n\n"
+            "🤖 XAU SMART TRADER v15.1\n\n"
             f"{label}\n\n"
             f"📈 الاتجاه: {'🟢 شراء' if engine['direction']=='BUY' else '🔴 بيع'}\n"
             f"💪 التوافق: {engine['score']}%\n"
@@ -1114,7 +1182,7 @@ def get_auto_signal():
                     for x in (m15_df, m5_df, m1_df)]
     engine = mtf_engine(m15, m5, m1)
 
-    if not engine["strict_ready"]:
+    if not engine["secret_ready"]:
         return None
 
     direction = engine["direction"]
@@ -1155,8 +1223,8 @@ async def auto_trade_loop():
                             continue
 
                         text = (
-                            "🚨 XAU SMART TRADER v14.1\n\n"
-                            f"{'💯 إشارة صارمة 100%' if signal['perfect'] else '🎯 دقة عالية 73%+'}\n\n"
+                            "🚨 XAU SMART TRADER v15.1\n\n"
+                            f"{'💯 إشارة صارمة 100%' if signal['perfect'] else '🕵️ Secret Scalp 85%+'}\n\n"
                             f"📈 الاتجاه: {'🟢 شراء' if signal['direction']=='BUY' else '🔴 بيع'}\n"
                             f"💪 التوافق: {signal['confidence']}%\n"
                             f"🛡️ الخطر: {signal['risk']}\n\n"
@@ -1299,7 +1367,7 @@ async def start_application():
     )
 
     BOT_STARTED = True
-    logger.info("XAU SMART TRADER v15.0 started: %s", WEBHOOK_URL)
+    logger.info("XAU SMART TRADER v15.1 started: %s", WEBHOOK_URL)
 
     # Daily/weekly scheduler. If JobQueue is unavailable in the installed
     # python-telegram-bot package, the explicit loops below still work.
