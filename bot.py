@@ -1246,23 +1246,9 @@ async def start_application():
     for name, fn in handlers.items():
         APPLICATION.add_handler(CommandHandler(name, fn))
 
-    # أوامر عربية مختصرة، مع إبقاء الأوامر الإنجليزية للتوافق مع الإصدارات السابقة.
-    arabic_commands = {
-        "يومي": daily,
-        "سكالب": scalp,
-        "صفقة": trade,
-        "مستويات": levels,
-        "سعر": price,
-        "أسبوعي": weekly,
-        "اشتراك": subscribe,
-        "الغاء": unsubscribe,
-        "إلغاء": unsubscribe,
-        "أسواق": markets,
-        "حالة": status,
-        "دعم": support,
-    }
-    for name, fn in arabic_commands.items():
-        APPLICATION.add_handler(CommandHandler(name, fn))
+    # ملاحظة مهمة: Telegram لا يقبل الأحرف العربية داخل CommandHandler.
+    # لذلك تبقى أسماء الأوامر البرمجية بالإنجليزية، بينما كل رسائل البوت وواجهته عربية.
+    # يمكن لاحقًا إضافة لوحة أزرار عربية لتنفيذ هذه الأوامر دون كتابة /command.
 
     await APPLICATION.initialize()
     await APPLICATION.start()
