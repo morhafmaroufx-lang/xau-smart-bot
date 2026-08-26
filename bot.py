@@ -15,7 +15,7 @@ from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # =========================================================
-# XAU SMART TRADER v14
+# XAU SMART TRADER v14.1
 # =========================================================
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -68,14 +68,14 @@ WEEKLY_REPORT_WEEK = None
 
 @app.route("/", methods=["GET", "HEAD"])
 def home():
-    return "XAU SMART TRADER v14 - OK", 200
+    return "XAU SMART TRADER v14.1 - OK", 200
 
 
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({
         "status": "ok",
-        "bot": "XAU SMART TRADER v14",
+        "bot": "XAU SMART TRADER v14.1",
         "time": datetime.now(DAMASCUS).isoformat()
     }), 200
 
@@ -703,22 +703,7 @@ def build_trade(direction, df):
         tp2 = entry - atr_v * 2.00
 
     return entry, sl, tp1, tp2, levels
-def direction_ar(direction):
-    return {
-        "BUY": "شراء 🟢",
-        "SELL": "بيع 🔴",
-        "WAIT": "انتظار 🟡"
-    }.get(direction, direction)
 
-
-def confidence_label(score):
-    if score >= 99:
-        return "💯 إشارة صارمة"
-    if score >= 73:
-        return "🎯 دقة عالية"
-    if score >= 65:
-        return "🟡 مراقبة"
-    return "🟠 ضعيفة"
 
 # =========================================================
 # FORMATTING
@@ -860,10 +845,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = "🟢 مفعلة" if subscribed else "🔕 غير مفعلة"
 
     text = (
-        "🤖 XAU SMART TRADER v14\n"
-        "🥇 XAUUSD Multi-Factor Engine\n\n"
+        "🤖 XAU SMART TRADER v14.1\n"
+        "🥇 محرك XAUUSD متعدد العوامل\n\n"
         "🎯 73% = عتبة تأهيل قوية\n"
-        "🕵️ Secret Scalp = M15 → M5 → M1\n"
+        "🕵️ السكالب السريع = M15 → M5 → M1\n"
         "🛡️ Risk + Conflict + Liquidity + Structure\n\n"
         f"📡 الصفقات التلقائية: {state}\n\n"
         "اختر من القائمة:"
@@ -877,22 +862,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     subscribed = update.effective_chat.id in SUBSCRIBERS
     await update.message.reply_text(
-        "🤖 XAU SMART TRADER v14\n\n"
+        "🤖 XAU SMART TRADER v14.1\n\n"
         "🟢 النظام: يعمل\n"
         "🌐 Webhook: يعمل\n"
         "📡 البيانات: متاحة\n"
         "🧠 Multi-Factor: ON\n"
-        "🕵️ Secret Scalp M15/M5/M1: ON\n"
-        f"🎯 Threshold: {TRADE_THRESHOLD}%\n"
-        f"💯 Strict 100% mode: ON\n"
-        "💧 Liquidity: ON\n"
-        "📦 Volume: ON\n"
-        "📈 ADX: ON\n"
-        "🧱 Structure: ON\n"
-        "🕯️ M15 wick: ON\n"
-        "🔢 Fibonacci: ON\n"
-        "🧠 Conflict detection: ON\n"
-        f"🔔 Auto trades: {'🟢 ON' if subscribed else '🔕 OFF'}"
+        "🕵️ Secret Scalp M15/M5/M1: مفعّل\n"
+        f"🎯 عتبة التأهيل: {TRADE_THRESHOLD}%\n"
+        f"💯 الوضع الصارم 100%: مفعّل\n"
+        "💧 السيولة: مفعّلة\n"
+        "📦 الحجم: مفعّل\n"
+        "📈 ADX: مفعّل\n"
+        "🧱 الهيكل السعري: مفعّل\n"
+        "🕯️ ذيل M15: مفعّل\n"
+        "🔢 فيبوناتشي: مفعّل\n"
+        "🧠 كشف التعارض: مفعّل\n"
+        f"🔔 الصفقات التلقائية: {'🟢 مفعّلة' if subscribed else '🔕 متوقفة'}"
     )
 
 
@@ -991,9 +976,10 @@ async def daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def scalp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await command_lock(update, "scalp"):
         return
-    try:f"سياق 15 دقيقة: {direction_ar(m15['direction'])} — {m15['score']}%\n"
-f"تأكيد 5 دقائق: {direction_ar(m5['direction'])} — {m5['score']}%\n"
-f"إشارة 1 دقيقة: {direction_ar(m1['direction'])} — {m1['score']}%\n"
+    try:
+        m15_df = get_bars("15m", 300)
+        m5_df = get_bars("5m", 300)
+        m1_df = get_bars("1m", 300)
 
         m15, m5, m1 = [analyze_frame(x, scalp=True)
                         for x in (m15_df, m5_df, m1_df)]
@@ -1002,16 +988,16 @@ f"إشارة 1 دقيقة: {direction_ar(m1['direction'])} — {m1['score']}%\n"
         levels = calculate_support_resistance(m5_df, 80)
 
         await update.message.reply_text(
-            "⚡ XAU SMART TRADER v14 — التحليل السريع\n\n"
+            "⚡ XAU SMART TRADER v14.1 — التحليل السريع\n\n"
             "📖 قراءة أولية\n"
             f"الاتجاه الحالي: {m15['trend']}\n"
             f"منطقة الاهتمام: دعم {levels['support1']:.2f} / مقاومة {levels['resistance1']:.2f}\n"
             f"نسبة التوافق: {engine['score']}%\n\n"
-            "🕵️ Secret MTF\n"
-            f"M15 Context: {m15['direction']} — {m15['score']}%\n"
-            f"M5 Confirmation: {m5['direction']} — {m5['score']}%\n"
-            f"M1 Trigger: {m1['direction']} — {m1['score']}%\n\n"
-            f"🎯 النتيجة: {'🟢 BUY' if engine['direction']=='BUY' else '🔴 SELL' if engine['direction']=='SELL' else '🟡 WAIT'}\n"
+            "🕵️ المحرك متعدد الفريمات\n"
+            f"سياق M15: {m15['direction']} — {m15['score']}%\n"
+            f"تأكيد M5: {m5['direction']} — {m5['score']}%\n"
+            f"إشارة M1: {m1['direction']} — {m1['score']}%\n\n"
+            f"🎯 النتيجة: {'🟢 شراء' if engine['direction']=='BUY' else '🔴 بيع' if engine['direction']=='SELL' else '🟡 انتظار'}\n"
             f"💪 التوافق: {engine['score']}%\n"
             f"🛡️ الخطر: {engine['risk']}\n"
             f"🧠 التعارضات: {engine['conflict']}\n"
@@ -1046,19 +1032,19 @@ async def trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         entry, sl, tp1, tp2, levels = build_trade(engine["direction"], m5_df)
-        label = "💯 STRICT 100%" if engine["perfect"] else "🎯 73%+ HIGH PRECISION"
+        label = "💯 إشارة صارمة 100%" if engine["perfect"] else "🎯 دقة عالية 73%+"
 
         await update.message.reply_text(
-            "🤖 XAU SMART TRADER v14\n\n"
+            "🤖 XAU SMART TRADER v14.1\n\n"
             f"{label}\n\n"
-            f"📈 الاتجاه: {'🟢 BUY' if engine['direction']=='BUY' else '🔴 SELL'}\n"
+            f"📈 الاتجاه: {'🟢 شراء' if engine['direction']=='BUY' else '🔴 بيع'}\n"
             f"💪 التوافق: {engine['score']}%\n"
             f"🛡️ الخطر: {engine['risk']}\n"
             f"🧠 التعارض: {engine['conflict']}\n\n"
-            f"📍 Entry: {entry:.2f}\n"
-            f"🛑 SL: {sl:.2f}\n"
-            f"🎯 TP1: {tp1:.2f}\n"
-            f"🎯 TP2: {tp2:.2f}\n\n"
+            f"📍 الدخول: {entry:.2f}\n"
+            f"🛑 وقف الخسارة: {sl:.2f}\n"
+            f"🎯 الهدف الأول: {tp1:.2f}\n"
+            f"🎯 الهدف الثاني: {tp2:.2f}\n\n"
             f"🧱 S1: {levels['support1']:.2f}\n"
             f"🔴 R1: {levels['resistance1']:.2f}\n\n"
             "⚠️ الإشارة تحليلية وليست ضمانًا للربح."
@@ -1068,7 +1054,7 @@ async def trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================================================
-# AUTO TRADES
+# الصفقات التلقائية
 # =========================================================
 
 def auto_window_open():
@@ -1126,15 +1112,15 @@ async def auto_trade_loop():
                             continue
 
                         text = (
-                            "🚨 XAU SMART TRADER v14\n\n"
-                            f"{'💯 STRICT 100%' if signal['perfect'] else '🎯 73%+ HIGH PRECISION'}\n\n"
-                            f"📈 الاتجاه: {'🟢 BUY' if signal['direction']=='BUY' else '🔴 SELL'}\n"
+                            "🚨 XAU SMART TRADER v14.1\n\n"
+                            f"{'💯 إشارة صارمة 100%' if signal['perfect'] else '🎯 دقة عالية 73%+'}\n\n"
+                            f"📈 الاتجاه: {'🟢 شراء' if signal['direction']=='BUY' else '🔴 بيع'}\n"
                             f"💪 التوافق: {signal['confidence']}%\n"
                             f"🛡️ الخطر: {signal['risk']}\n\n"
-                            f"📍 Entry: {signal['entry']:.2f}\n"
-                            f"🛑 SL: {signal['sl']:.2f}\n"
-                            f"🎯 TP1: {signal['tp1']:.2f}\n"
-                            f"🎯 TP2: {signal['tp2']:.2f}\n\n"
+                            f"📍 الدخول: {signal['entry']:.2f}\n"
+                            f"🛑 وقف الخسارة: {signal['sl']:.2f}\n"
+                            f"🎯 الهدف الأول: {signal['tp1']:.2f}\n"
+                            f"🎯 الهدف الثاني: {signal['tp2']:.2f}\n\n"
                             "🕯️ يفضّل انتظار تأكيد الشمعة."
                         )
 
@@ -1260,8 +1246,29 @@ async def start_application():
     for name, fn in handlers.items():
         APPLICATION.add_handler(CommandHandler(name, fn))
 
+    # أوامر عربية مختصرة، مع إبقاء الأوامر الإنجليزية للتوافق مع الإصدارات السابقة.
+    arabic_commands = {
+        "يومي": daily,
+        "سكالب": scalp,
+        "صفقة": trade,
+        "مستويات": levels,
+        "سعر": price,
+        "أسبوعي": weekly,
+        "اشتراك": subscribe,
+        "الغاء": unsubscribe,
+        "إلغاء": unsubscribe,
+        "أسواق": markets,
+        "حالة": status,
+        "دعم": support,
+    }
+    for name, fn in arabic_commands.items():
+        APPLICATION.add_handler(CommandHandler(name, fn))
+
     await APPLICATION.initialize()
     await APPLICATION.start()
+
+    if not WEBHOOK_URL.startswith(("https://", "http://")):
+        raise RuntimeError(f"رابط Webhook غير صالح: {WEBHOOK_URL}")
 
     await APPLICATION.bot.set_webhook(
         url=WEBHOOK_URL,
@@ -1270,7 +1277,7 @@ async def start_application():
     )
 
     BOT_STARTED = True
-    logger.info("XAU SMART TRADER v14 started: %s", WEBHOOK_URL)
+    logger.info("XAU SMART TRADER v14.1 started: %s", WEBHOOK_URL)
 
     # Daily/weekly scheduler. If JobQueue is unavailable in the installed
     # python-telegram-bot package, the explicit loops below still work.
@@ -1309,7 +1316,7 @@ async def scheduler_loop():
                 WEEKLY_REPORT = None
                 WEEKLY_REPORT_WEEK = None
 
-            # 15-minute pre-New-York alert. v14 requested 16:00 Damascus.
+            # 15-minute pre-New-York alert. المطلوب في الإصدار 16:00 Damascus.
             alert_at = (datetime.combine(
                 now.date(), dtime(16, 0), tzinfo=DAMASCUS
             ) - timedelta(minutes=15))
@@ -1324,7 +1331,7 @@ async def scheduler_loop():
                     try:
                         await APPLICATION.bot.send_message(
                             chat_id=chat_id,
-                            text="🔔 تنبيه: تبقى 15 دقيقة على افتتاح نيويورك حسب توقيت v14 (4:00 م دمشق)."
+                            text="🔔 تنبيه: تبقى 15 دقيقة على افتتاح نيويورك حسب توقيت v14.1 (4:00 م دمشق)."
                         )
                     except Exception:
                         logger.exception("Market alert error")
