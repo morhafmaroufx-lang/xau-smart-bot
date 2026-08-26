@@ -12,7 +12,7 @@ import numpy as np
 
 from flask import Flask, request, jsonify
 from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
 # =========================================================
 # XAU SMART TRADER v14.1
@@ -831,32 +831,57 @@ async def command_lock(update, command):
     return True
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
-        ["📊 /daily", "⚡ /scalp"],
-        ["🎯 /trade", "📍 /levels"],
-        ["💰 /price", "📅 /weekly"],
-        ["🟢 /subscribe", "🔕 /unsubscribe"],
-        ["🌍 /markets", "🟢 /status"],
-        ["🆘 /support"]
+        ["📊 التحليل اليومي", "⚡ التحليل السريع"],
+        ["🕵️ Secret Scalp", "🎯 صفقة الآن"],
+        ["📍 الدعوم والمقاومات", "💰 سعر الذهب"],
+        ["🔔 تفعيل الصفقات التلقائية", "🔕 إيقاف الصفقات التلقائية"],
+        ["🌍 الأسواق", "🟢 حالة النظام"],
+        ["🆘 الدعم"],
     ]
-
     subscribed = update.effective_chat.id in SUBSCRIBERS
-    state = "🟢 مفعلة" if subscribed else "🔕 غير مفعلة"
-
+    state = "🟢 مفعّلة" if subscribed else "🔕 متوقفة"
     text = (
-        "🤖 XAU SMART TRADER v14.1\n"
+        "🤖 XAU SMART TRADER\n"
         "🥇 محرك XAUUSD متعدد العوامل\n\n"
         "🎯 73% = عتبة تأهيل قوية\n"
-        "🕵️ السكالب السريع = M15 → M5 → M1\n"
-        "🛡️ Risk + Conflict + Liquidity + Structure\n\n"
+        "🕵️ M15 → M5 → M1\n"
+        "🛡️ Structure + Liquidity + Volume + Risk\n\n"
         f"📡 الصفقات التلقائية: {state}\n\n"
-        "اختر من القائمة:"
+        "اختر العملية 👇"
     )
     await update.message.reply_text(
         text,
         reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     )
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Compatibility only: /start is not part of the visible menu.
+    await show_main_menu(update, context)
+
+
+async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    routes = {
+        "📊 التحليل اليومي": daily,
+        "⚡ التحليل السريع": quick,
+        "🕵️ Secret Scalp": scalp,
+        "🎯 صفقة الآن": trade,
+        "📍 الدعوم والمقاومات": levels,
+        "💰 سعر الذهب": price,
+        "🔔 تفعيل الصفقات التلقائية": subscribe,
+        "🔕 إيقاف الصفقات التلقائية": unsubscribe,
+        "🌍 الأسواق": markets,
+        "🟢 حالة النظام": status,
+        "🆘 الدعم": support,
+    }
+    fn = routes.get(text)
+    if fn:
+        await fn(update, context)
+    else:
+        await show_main_menu(update, context)
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -971,6 +996,24 @@ async def daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         await safe_reply(update, f"❌ تعذر تنفيذ التحليل اليومي: {e}")
+
+
+async def quick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await command_lock(update, "quick"):
+        return
+    try:
+        m15_df = get_bars("15m", 300)
+        m15 = analyze_frame(m15_df, scalp=True)
+        levels = calculate_support_resistance(m15_df, 80)
+        await update.message.reply_text(
+            "⚡ التحليل السريع — XAUUSD\n\n"
+            f"1. الاتجاه الحالي: {m15['trend']}\n"
+            f"2. منطقة الاهتمام: دعم {levels['support1']:.2f} / مقاومة {levels['resistance1']:.2f}\n"
+            f"3. نسبة التوافق: {m15['score']}%\n\n"
+            f"القرار الأولي: {'🟢 صاعد' if m15['direction']=='BUY' else '🔴 هابط' if m15['direction']=='SELL' else '🟡 انتظار'}"
+        )
+    except Exception as e:
+        await safe_reply(update, f"❌ تعذر تنفيذ التحليل السريع: {e}")
 
 
 async def scalp(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1228,27 +1271,20 @@ async def start_application():
 
     APPLICATION = Application.builder().token(TOKEN).build()
 
+    # الأوامر البرمجية تبقى مخفية عن لوحة المستخدم، وتستخدم للتوافق فقط.
     handlers = {
-        "start": start,
-        "status": status,
-        "price": price,
-        "levels": levels,
-        "weekly": weekly,
-        "daily": daily,
-        "scalp": scalp,
-        "trade": trade,
-        "subscribe": subscribe,
-        "unsubscribe": unsubscribe,
-        "markets": markets,
-        "support": support,
+        "status": status, "price": price, "levels": levels,
+        "weekly": weekly, "daily": daily, "scalp": scalp,
+        "trade": trade, "subscribe": subscribe, "unsubscribe": unsubscribe,
+        "markets": markets, "support": support,
     }
-
     for name, fn in handlers.items():
         APPLICATION.add_handler(CommandHandler(name, fn))
 
-    # ملاحظة مهمة: Telegram لا يقبل الأحرف العربية داخل CommandHandler.
-    # لذلك تبقى أسماء الأوامر البرمجية بالإنجليزية، بينما كل رسائل البوت وواجهته عربية.
-    # يمكن لاحقًا إضافة لوحة أزرار عربية لتنفيذ هذه الأوامر دون كتابة /command.
+    # /start توافق خلفي فقط؛ لا يظهر ضمن لوحة البوت.
+    APPLICATION.add_handler(CommandHandler("start", show_main_menu))
+    # لوحة عربية مباشرة: كل زر يشغّل الوظيفة المقابلة بدون أوامر ظاهرة.
+    APPLICATION.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, button_router))
 
     await APPLICATION.initialize()
     await APPLICATION.start()
@@ -1263,7 +1299,7 @@ async def start_application():
     )
 
     BOT_STARTED = True
-    logger.info("XAU SMART TRADER v14.1 started: %s", WEBHOOK_URL)
+    logger.info("XAU SMART TRADER v15.0 started: %s", WEBHOOK_URL)
 
     # Daily/weekly scheduler. If JobQueue is unavailable in the installed
     # python-telegram-bot package, the explicit loops below still work.
