@@ -1029,9 +1029,7 @@ async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         try:
-            df = get_bars("1d", 10)
-        except Exception:
-            df = get_bars("1h", 50)
+            df = get_bars("1m", 5)
         if len(df) < 2:
             raise ValueError("بيانات السعر الحالية غير كافية")
         current = safe_float(df["close"].iloc[-1])
