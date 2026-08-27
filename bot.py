@@ -1022,8 +1022,6 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🧠 كشف التعارض: مفعّل\n"
         f"🔔 الصفقات التلقائية: {'🟢 مفعّلة' if subscribed else '🔕 متوقفة'}"
     )
-
-
 async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await command_lock(update, "price"):
         return
@@ -1036,44 +1034,21 @@ async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pct = live["day_pct"]
 
         text = (
-            "🥇 XAUUSD\n\n"
-            f"💰 السعر اللحظي: {current:.2f}\n"
-            f"📊 التغير: {change:+.2f} ({pct:+.2f}%)\n"
-            f"🕐 دمشق: "
-            f"{datetime.now(DAMASCUS).strftime('%Y-%m-%d %I:%M:%S %p')}"
-        )
-
-        await command_reply(update, "price", text)
-
-    except Exception as e:
-        await safe_reply(
-            update,
-            "❌ تعذر الحصول على السعر اللحظي.\n"
-            "🚫 لم يتم استخدام OHLC كبديل حتى لا يظهر سعر قديم على أنه لحظي.\n"
-            f"السبب: {e}"
-        )
-
-
-async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await command_lock(update, "price"):
-        return
-    try:
-        quote = await asyncio.to_thread(get_live_price)
-        current = quote["price"]
-        change = quote["day_diff"]
-        pct = quote["day_pct"]
-        text = (
             "🥇 XAUUSD — السعر اللحظي\n\n"
             f"💰 السعر: {current:.2f}\n"
             f"📊 التغير اليومي: {change:+.2f} ({pct:+.2f}%)\n"
-            f"🟢 المصدر: Biquote Live Quote\n"
-            f"🕐 دمشق: {datetime.now(DAMASCUS).strftime('%Y-%m-%d %I:%M:%S %p')}"
+            f"🕐 دمشق: "
+            f"{datetime.now(DAMASCUS).strftime('%Y-%m-%d %I:%M:%S %p')}\n\n"
+            "🟢 المصدر: السعر المباشر\n"
+            "⚠️ لم يتم استخدام OHLC كبديل."
         )
+
         await command_reply(update, "price", text)
+
     except Exception as e:
         await safe_reply(
             update,
-            "❌ تعذر الحصول على السعر اللحظي.\n"
+            "❌ تعذر الحصول على السعر اللحظي.\n\n"
             "لم يتم استخدام OHLC كبديل حتى لا يظهر سعر قديم على أنه لحظي.\n"
             f"السبب: {e}"
         )
