@@ -15,7 +15,7 @@ from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
 # =========================================================
-# XAU SMART TRADER v16.4
+# XAU SMART TRADER v16.5
 # =========================================================
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -73,14 +73,14 @@ WEEKLY_REPORT_WEEK = None
 
 @app.route("/", methods=["GET", "HEAD"])
 def home():
-    return "XAU SMART TRADER v16.4 - OK", 200
+    return "XAU SMART TRADER v16.5 - OK", 200
 
 
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({
         "status": "ok",
-        "bot": "XAU SMART TRADER v16.4",
+        "bot": "XAU SMART TRADER v16.5",
         "time": datetime.now(DAMASCUS).isoformat()
     }), 200
 
@@ -533,14 +533,14 @@ def analyze_frame(df, scalp=False):
 # LEVELS / ENTRY
 # =========================================================
 
-def calculate_support_resistance(df, lookback=80):
+def calculate_support_resistance(df, lookback=80, current_override=None):
     """Build S/R from confirmed swing pivots, clustered by ATR.
 
     This avoids treating every candle high/low as an independent level, which
     was the reason v15 could output very noisy levels such as 4610.38/4611.33.
     """
     x = df.tail(min(lookback, len(df))).copy().reset_index(drop=True)
-    current = safe_float(x["close"].iloc[-1])
+    current = safe_float(current_override) if current_override is not None else safe_float(x["close"].iloc[-1])
     atr_v = max(safe_float(atr(x["high"], x["low"], x["close"], 14).iloc[-1]), 0.05)
     radius = atr_v * S_R_CLUSTER_ATR
 
@@ -781,8 +781,8 @@ def mtf_engine(m15, m5, m1):
     }
 
 
-def build_trade(direction, df):
-    current = safe_float(df["close"].iloc[-1])
+def build_trade(direction, df, current_override=None):
+    current = safe_float(current_override) if current_override is not None else safe_float(df["close"].iloc[-1])
     atr_v = max(safe_float(
         atr(df["high"], df["low"], df["close"], 14).iloc[-1]
     ), 0.10)
@@ -1004,7 +1004,7 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     subscribed = update.effective_chat.id in SUBSCRIBERS
     await update.message.reply_text(
-        "🤖 XAU SMART TRADER v16.4\n\n"
+        "🤖 XAU SMART TRADER v16.5\n\n"
         "🟢 النظام: يعمل\n"
         "🌐 Webhook: يعمل\n"
         "📡 البيانات: متاحة\n"
@@ -1026,68 +1026,76 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def get_live_price():
-    """جلب سعر XAUUSD اللحظي فقط.
+    """جلب السعر اللحظي الحقيقي فقط، مع مصادر بديلة موثوقة.
 
-    الأولوية: Biquote ثم XAUS ثم GoldPrice.dev.
     لا يتم استخدام OHLC كبديل للسعر اللحظي.
-    لا يتم قبول أي سعر stale أو أقدم من 120 ثانية.
+    إذا أعاد Biquote خطأ 404 أو لم يعطِ اقتباسًا صالحًا،
+    ننتقل تلقائيًا إلى XAUS ثم GoldPrice.dev.
     """
     errors = []
 
-    # 1) Biquote
+    # 1) Biquote: endpoint مباشر، لكن لا نعتمد عليه وحده.
     try:
-        r = requests.get(LIVE_PRICE_URL, params={"allowStale": "true"}, timeout=10)
-        data = r.json() if r.content else {}
-        if r.status_code == 200 and isinstance(data, dict):
-            state = str(data.get("marketState", "")).lower()
-            stale = bool(data.get("stale", False))
-            age = safe_float(data.get("quoteAgeSeconds"), None)
-            price = safe_float(data.get("mid"), None)
-            if price and price > 0 and state == "open" and not stale and (age is None or age <= 120):
-                pct = safe_float(data.get("dayDiffPercent"), 0.0)
-                diff = safe_float(data.get("dayDiff"), None)
-                if diff is None:
-                    diff = price * pct / 100.0
-                return {"price": price, "day_diff": diff, "day_pct": pct,
-                        "raw": data, "source": "Biquote Live Quote", "age": age}
-            errors.append(f"Biquote: state={state or 'unknown'}, stale={stale}, age={age}")
+        r = requests.get(LIVE_PRICE_URL, params={"allowStale": "false"}, timeout=8)
+        if r.status_code == 200 and r.content:
+            data = r.json()
+            if isinstance(data, dict):
+                state = str(data.get("marketState", "")).lower()
+                stale = bool(data.get("stale", False))
+                age = safe_float(data.get("quoteAgeSeconds"), None)
+                price = safe_float(data.get("mid"), None)
+                if price and price > 0 and not stale and (age is None or age <= 120):
+                    pct = safe_float(data.get("dayDiffPercent"), 0.0)
+                    diff = safe_float(data.get("dayDiff"), None)
+                    if diff is None:
+                        diff = price * pct / 100.0
+                    return {"price": price, "day_diff": diff, "day_pct": pct,
+                            "raw": data, "source": "Biquote Live Quote", "age": age}
+                errors.append(f"Biquote: state={state or 'unknown'}, stale={stale}, age={age}")
         else:
             errors.append(f"Biquote HTTP {r.status_code}")
     except Exception as e:
         errors.append(f"Biquote: {e}")
 
-    # 2) XAUS fresh spot
+    # 2) XAUS: المصدر الاحتياطي الأساسي للسعر الفوري.
     try:
-        r = requests.get("https://xaus.com/api/v1/spot", timeout=10)
-        data = r.json() if r.content else {}
-        state = data.get("data_state") or {}
-        status = str(state.get("status", "")).lower()
-        age = safe_float(state.get("age_seconds"), None)
-        price = safe_float(data.get("spot_usd_oz"), None)
-        if price and price > 0 and status in {"fresh", "live"} and (age is None or age <= 120):
-            return {"price": price, "day_diff": 0.0, "day_pct": 0.0,
-                    "raw": data, "source": "XAUS Live Spot", "age": age}
-        errors.append(f"XAUS: status={status or 'unknown'}, age={age}")
+        r = requests.get("https://xaus.com/api/v1/spot", timeout=8)
+        if r.status_code == 200 and r.content:
+            data = r.json()
+            state = data.get("data_state") or {}
+            status = str(state.get("status", "")).lower()
+            age = safe_float(state.get("age_seconds"), None)
+            price = safe_float(data.get("spot_usd_oz"), None)
+            if price and price > 0 and status in {"fresh", "live", "open"} and (age is None or age <= 120):
+                return {"price": price, "day_diff": 0.0, "day_pct": 0.0,
+                        "raw": data, "source": "XAUS Live Spot", "age": age}
+            errors.append(f"XAUS: status={status or 'unknown'}, age={age}, price={price}")
+        else:
+            errors.append(f"XAUS HTTP {r.status_code}")
     except Exception as e:
         errors.append(f"XAUS: {e}")
 
-    # 3) GoldPrice.dev fresh spot
+    # 3) GoldPrice.dev: احتياطي أخير، بشرط ألا يكون stale.
     try:
         r = requests.get("https://api.goldprice.dev/v1/prices",
-                         params={"symbol": "XAU-USD-SPOT"}, timeout=10)
-        data = r.json() if r.content else {}
-        items = data.get("symbols") or []
-        item = items[0] if items else {}
-        price = safe_float(item.get("price"), None)
-        stale = bool(item.get("is_stale", False))
-        if price and price > 0 and not stale:
-            return {"price": price, "day_diff": 0.0, "day_pct": 0.0,
-                    "raw": data, "source": "GoldPrice.dev Live Spot", "age": None}
-        errors.append(f"GoldPrice.dev: stale={stale}")
+                         params={"symbol": "XAU-USD-SPOT"}, timeout=8)
+        if r.status_code == 200 and r.content:
+            data = r.json()
+            items = data.get("symbols") or []
+            item = items[0] if items else {}
+            price = safe_float(item.get("price"), None)
+            stale = bool(item.get("is_stale", False))
+            age = safe_float(item.get("age_seconds"), None)
+            if price and price > 0 and not stale and (age is None or age <= 120):
+                return {"price": price, "day_diff": 0.0, "day_pct": 0.0,
+                        "raw": data, "source": "GoldPrice.dev Live Spot", "age": age}
+            errors.append(f"GoldPrice.dev: stale={stale}, age={age}")
+        else:
+            errors.append(f"GoldPrice.dev HTTP {r.status_code}")
     except Exception as e:
         errors.append(f"GoldPrice.dev: {e}")
 
-    raise RuntimeError("لا يوجد مصدر سعر لحظي حديث حاليًا | " + " | ".join(errors))
+    raise RuntimeError("سوق الذهب مغلق أو لا يوجد اقتباس لحظي حالي | " + " | ".join(errors))
 
 
 async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1162,7 +1170,9 @@ async def daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
         h1 = get_bars("1h", 300)
 
         dr, hr, h1r = [analyze_frame(x) for x in (d1, h4, h1)]
-        levels = calculate_support_resistance(d1, 80)
+        quote = await asyncio.to_thread(get_live_price)
+        live_current = quote["price"]
+        levels = calculate_support_resistance(d1, 80, live_current)
         score = int(round(dr["score"]*.45 + hr["score"]*.35 + h1r["score"]*.20))
         bias = "🟢 صاعد" if score >= 50 and dr["direction"] == "BUY" else \
                "🔴 هابط" if score >= 50 and dr["direction"] == "SELL" else "🟡 مختلط"
@@ -1171,7 +1181,8 @@ async def daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📊 تحليل الذهب\n"
             f"ليوم {datetime.now(DAMASCUS).strftime('%Y-%m-%d')} "
             f"بتوقيت دمشق {datetime.now(DAMASCUS).strftime('%I:%M %p')}\n\n"
-            f"💰 السعر الحالي: {dr['price']:.2f}\n\n"
+            f"💰 السعر الحالي: {live_current:.2f}\n"
+            f"🟢 المصدر: {quote.get("source", "Live")} | عمر الاقتباس: {quote.get("age")} ثانية\n\n"
             "🎯 الخلاصة التنفيذية\n"
             f"1. الاتجاه العام: {bias}\n"
             f"2. الزخم: RSI {dr['rsi']:.1f}\n"
@@ -1207,10 +1218,13 @@ async def quick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         m1_df = get_bars("1m", 300)
         m15, m5, m1 = [analyze_frame(x, scalp=True) for x in (m15_df, m5_df, m1_df)]
         engine = mtf_engine(m15, m5, m1)
-        levels = calculate_support_resistance(m5_df, 80)
+        quote = await asyncio.to_thread(get_live_price)
+        live_current = quote["price"]
+        levels = calculate_support_resistance(m5_df, 80, live_current)
         result = (
             "⚡ XAU SMART TRADER v16.4 — التحليل السريع\n\n"
             "📖 قراءة أولية\n"
+            f"💰 السعر اللحظي: {live_current:.2f}\n"
             f"الاتجاه الحالي: {m15['trend']}\n"
             f"منطقة الاهتمام: دعم {levels['support1']:.2f} / مقاومة {levels['resistance1']:.2f}\n"
             f"نسبة التوافق: {engine['score']}%\n\n"
@@ -1243,11 +1257,14 @@ async def scalp(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         for x in (m15_df, m5_df, m1_df)]
         engine = mtf_engine(m15, m5, m1)
 
-        levels = calculate_support_resistance(m5_df, 80)
+        quote = await asyncio.to_thread(get_live_price)
+        live_current = quote["price"]
+        levels = calculate_support_resistance(m5_df, 80, live_current)
 
         await command_reply(update, "scalp",
             "🕵️ XAU SMART TRADER — Secret Scalp\n\n"
             "📖 قراءة أولية\n"
+            f"💰 السعر اللحظي: {live_current:.2f}\n"
             f"الاتجاه الحالي: {m15['trend']}\n"
             f"منطقة الاهتمام: دعم {levels['support1']:.2f} / مقاومة {levels['resistance1']:.2f}\n"
             f"نسبة التوافق: {engine['score']}%\n\n"
@@ -1292,11 +1309,12 @@ async def trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        entry, sl, tp1, tp2, levels = build_trade(engine["direction"], m5_df)
+        live = await asyncio.to_thread(get_live_price)
+        entry, sl, tp1, tp2, levels = build_trade(engine["direction"], m5_df, live["price"])
         label = "💯 إشارة صارمة 100%" if engine["perfect"] else "🎯 دقة عالية 73%+"
 
         await command_reply(update, "trade",
-            "🤖 XAU SMART TRADER v16.4\n\n"
+            "🤖 XAU SMART TRADER v16.5\n\n"
             f"{label}\n\n"
             f"📈 الاتجاه: {'🟢 شراء' if engine['direction']=='BUY' else '🔴 بيع'}\n"
             f"💪 التوافق: {engine['score']}%\n"
@@ -1336,7 +1354,8 @@ def get_auto_signal():
         return None
 
     direction = engine["direction"]
-    entry, sl, tp1, tp2, levels = build_trade(direction, m5_df)
+    live = get_live_price()
+    entry, sl, tp1, tp2, levels = build_trade(direction, m5_df, live["price"])
     candle_key = None
     if "openTime" in m5_df.columns and len(m5_df):
         candle_key = str(m5_df["openTime"].iloc[-1])
