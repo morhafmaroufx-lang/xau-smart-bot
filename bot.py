@@ -15,7 +15,7 @@ from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
 # =========================================================
-# XAU SMART TRADER v16.3
+# XAU SMART TRADER v16.4
 # =========================================================
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -29,6 +29,7 @@ WEBHOOK_URL = f"{RENDER_URL}{WEBHOOK_PATH}"
 
 SYMBOL = "XAUUSD"
 DATA_URL = "https://biquote.io/api/XAUUSD/ohlc"
+LIVE_PRICE_URL = "https://biquote.io/api/XAUUSD"
 
 DAMASCUS = ZoneInfo("Asia/Damascus")
 NEW_YORK = ZoneInfo("America/New_York")
@@ -72,14 +73,14 @@ WEEKLY_REPORT_WEEK = None
 
 @app.route("/", methods=["GET", "HEAD"])
 def home():
-    return "XAU SMART TRADER v16.3 - OK", 200
+    return "XAU SMART TRADER v16.4 - OK", 200
 
 
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({
         "status": "ok",
-        "bot": "XAU SMART TRADER v16.3",
+        "bot": "XAU SMART TRADER v16.4",
         "time": datetime.now(DAMASCUS).isoformat()
     }), 200
 
@@ -1003,7 +1004,7 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     subscribed = update.effective_chat.id in SUBSCRIBERS
     await update.message.reply_text(
-        "🤖 XAU SMART TRADER v16.3\n\n"
+        "🤖 XAU SMART TRADER v16.4\n\n"
         "🟢 النظام: يعمل\n"
         "🌐 Webhook: يعمل\n"
         "📡 البيانات: متاحة\n"
@@ -1025,61 +1026,68 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def get_live_price():
-    """جلب السعر اللحظي الحقيقي من Biquote دون استخدام OHLC كبديل.
+    """جلب سعر XAUUSD اللحظي فقط.
 
-    Biquote يعيد 404 عند استخدام allowStale=false إذا كان آخر اقتباس
-    أقدم من خمس دقائق. لذلك نطلب الاقتباس العادي ثم نتحقق نحن من
-    marketState/stale/quoteAgeSeconds حتى لا يظهر سعر قديم على أنه لحظي.
+    الأولوية: Biquote ثم XAUS ثم GoldPrice.dev.
+    لا يتم استخدام OHLC كبديل للسعر اللحظي.
+    لا يتم قبول أي سعر stale أو أقدم من 120 ثانية.
     """
-    url = f"https://biquote.io/api/{SYMBOL}"
+    errors = []
 
-    response = requests.get(url, timeout=10)
-    response.raise_for_status()
-    data = response.json()
-
-    if not isinstance(data, dict):
-        raise ValueError("مصدر السعر اللحظي أعاد استجابة غير صالحة")
-
-    # لا نقبل سعرًا قديمًا أو سوقًا مغلقًا كسعر لحظي.
-    market_state = str(data.get("marketState", "")).lower()
-    stale = bool(data.get("stale", False))
-    age_raw = data.get("quoteAgeSeconds")
+    # 1) Biquote
     try:
-        age = float(age_raw) if age_raw is not None else 0.0
-    except (TypeError, ValueError):
-        age = 0.0
+        r = requests.get(LIVE_PRICE_URL, params={"allowStale": "true"}, timeout=10)
+        data = r.json() if r.content else {}
+        if r.status_code == 200 and isinstance(data, dict):
+            state = str(data.get("marketState", "")).lower()
+            stale = bool(data.get("stale", False))
+            age = safe_float(data.get("quoteAgeSeconds"), None)
+            price = safe_float(data.get("mid"), None)
+            if price and price > 0 and state == "open" and not stale and (age is None or age <= 120):
+                pct = safe_float(data.get("dayDiffPercent"), 0.0)
+                diff = safe_float(data.get("dayDiff"), None)
+                if diff is None:
+                    diff = price * pct / 100.0
+                return {"price": price, "day_diff": diff, "day_pct": pct,
+                        "raw": data, "source": "Biquote Live Quote", "age": age}
+            errors.append(f"Biquote: state={state or 'unknown'}, stale={stale}, age={age}")
+        else:
+            errors.append(f"Biquote HTTP {r.status_code}")
+    except Exception as e:
+        errors.append(f"Biquote: {e}")
 
-    if market_state == "closed":
-        raise ValueError("سوق الذهب مغلق أو لا يوجد اقتباس لحظي حالي")
-    if stale:
-        raise ValueError("آخر اقتباس أصبح قديمًا")
-    if age > 300:
-        raise ValueError(f"عمر الاقتباس {age:.0f} ثانية، وليس لحظيًا")
+    # 2) XAUS fresh spot
+    try:
+        r = requests.get("https://xaus.com/api/v1/spot", timeout=10)
+        data = r.json() if r.content else {}
+        state = data.get("data_state") or {}
+        status = str(state.get("status", "")).lower()
+        age = safe_float(state.get("age_seconds"), None)
+        price = safe_float(data.get("spot_usd_oz"), None)
+        if price and price > 0 and status in {"fresh", "live"} and (age is None or age <= 120):
+            return {"price": price, "day_diff": 0.0, "day_pct": 0.0,
+                    "raw": data, "source": "XAUS Live Spot", "age": age}
+        errors.append(f"XAUS: status={status or 'unknown'}, age={age}")
+    except Exception as e:
+        errors.append(f"XAUS: {e}")
 
-    current = safe_float(data.get("mid"), None)
-    if current is None or current <= 0:
-        bid = safe_float(data.get("bid"), None)
-        ask = safe_float(data.get("ask"), None)
-        if bid is not None and ask is not None and bid > 0 and ask > 0:
-            current = (bid + ask) / 2.0
+    # 3) GoldPrice.dev fresh spot
+    try:
+        r = requests.get("https://api.goldprice.dev/v1/prices",
+                         params={"symbol": "XAU-USD-SPOT"}, timeout=10)
+        data = r.json() if r.content else {}
+        items = data.get("symbols") or []
+        item = items[0] if items else {}
+        price = safe_float(item.get("price"), None)
+        stale = bool(item.get("is_stale", False))
+        if price and price > 0 and not stale:
+            return {"price": price, "day_diff": 0.0, "day_pct": 0.0,
+                    "raw": data, "source": "GoldPrice.dev Live Spot", "age": None}
+        errors.append(f"GoldPrice.dev: stale={stale}")
+    except Exception as e:
+        errors.append(f"GoldPrice.dev: {e}")
 
-    if current is None or current <= 0:
-        raise ValueError("مصدر السعر اللحظي لم يُرجع mid/bid/ask صالحًا")
-
-    day_pct = safe_float(data.get("dayDiffPercent"), 0.0)
-    day_diff = safe_float(data.get("dayDiff"), None)
-    if day_diff is None:
-        day_diff = current * day_pct / 100.0
-
-    return {
-        "price": current,
-        "day_diff": day_diff,
-        "day_pct": day_pct,
-        "source": "Biquote Live Quote",
-        "quote_age": age,
-        "market_state": market_state or "open",
-        "raw": data,
-    }
+    raise RuntimeError("لا يوجد مصدر سعر لحظي حديث حاليًا | " + " | ".join(errors))
 
 
 async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1094,8 +1102,8 @@ async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🥇 XAUUSD — السعر اللحظي\n\n"
             f"💰 السعر: {current:.2f}\n"
             f"📊 التغير اليومي: {change:+.2f} ({pct:+.2f}%)\n"
-            f"🟢 المصدر: Biquote Live Quote\n"
-            f"⚡ عمر الاقتباس: {quote.get('quote_age', 0):.0f} ثانية\n"
+            f"🟢 المصدر: {quote.get("source", "Live")}\n"
+            f"⚡ عمر الاقتباس: {quote.get("age")} ثانية\n"
             f"🕐 دمشق: {datetime.now(DAMASCUS).strftime('%Y-%m-%d %I:%M:%S %p')}"
         )
         await command_reply(update, "price", text)
@@ -1201,7 +1209,7 @@ async def quick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         engine = mtf_engine(m15, m5, m1)
         levels = calculate_support_resistance(m5_df, 80)
         result = (
-            "⚡ XAU SMART TRADER v16.3 — التحليل السريع\n\n"
+            "⚡ XAU SMART TRADER v16.4 — التحليل السريع\n\n"
             "📖 قراءة أولية\n"
             f"الاتجاه الحالي: {m15['trend']}\n"
             f"منطقة الاهتمام: دعم {levels['support1']:.2f} / مقاومة {levels['resistance1']:.2f}\n"
@@ -1288,7 +1296,7 @@ async def trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
         label = "💯 إشارة صارمة 100%" if engine["perfect"] else "🎯 دقة عالية 73%+"
 
         await command_reply(update, "trade",
-            "🤖 XAU SMART TRADER v16.3\n\n"
+            "🤖 XAU SMART TRADER v16.4\n\n"
             f"{label}\n\n"
             f"📈 الاتجاه: {'🟢 شراء' if engine['direction']=='BUY' else '🔴 بيع'}\n"
             f"💪 التوافق: {engine['score']}%\n"
@@ -1372,7 +1380,7 @@ async def auto_trade_loop():
                             continue
 
                         text = (
-                            "🚨 XAU SMART TRADER v16.3\n\n"
+                            "🚨 XAU SMART TRADER v16.4\n\n"
                             f"{'💯 إشارة صارمة 100%' if signal['perfect'] else '🕵️ Secret Scalp 85%+'}\n\n"
                             f"📈 الاتجاه: {'🟢 شراء' if signal['direction']=='BUY' else '🔴 بيع'}\n"
                             f"💪 التوافق: {signal['confidence']}%\n"
@@ -1516,7 +1524,7 @@ async def start_application():
     )
 
     BOT_STARTED = True
-    logger.info("XAU SMART TRADER v16.3 started: %s", WEBHOOK_URL)
+    logger.info("XAU SMART TRADER v16.4 started: %s", WEBHOOK_URL)
 
     # Daily/weekly scheduler. If JobQueue is unavailable in the installed
     # python-telegram-bot package, the explicit loops below still work.
