@@ -1060,33 +1060,57 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔔 الصفقات التلقائية: {'🟢 مفعّلة' if subscribed else '🔕 متوقفة'}"
     )
 
-
 async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await command_lock(update, "price"):
         return
+
     try:
-        tick = get_live_price()
+        url = "https://biquote.io/api/XAUUSD"
+
+        response = requests.get(
+            url,
+            timeout=10,
+            headers={"Accept": "application/json"}
+        )
+        response.raise_for_status()
+
+        tick = response.json()
+
         current = safe_float(tick.get("mid"))
-        bid = safe_float(tick.get("bid"))
-        ask = safe_float(tick.get("ask"))
-        pct = safe_float(tick.get("dayDiffPercent"))
-        quote_age = tick.get("quoteAgeSeconds", "?")
-        market_state = tick.get("marketState", "unknown")
+        day_change = safe_float(tick.get("dayDiffPercent"))
+
+        if current <= 0:
+            raise ValueError("السعر اللحظي غير صالح")
+
+        age = safe_float(tick.get("quoteAgeSeconds"), 999999)
+        market_state = str(
+            tick.get("marketState", "unknown")
+        ).lower()
+
+        # نرفض السعر إذا كان قديمًا أكثر من 5 دقائق
+        if age > 300:
+            raise ValueError(
+                f"السعر اللحظي قديم ({age:.0f} ثانية)"
+            )
 
         text = (
-            f"🥇 XAUUSD — السعر اللحظي\n\n"
-            f"💰 السعر: {current:.2f}\n"
-            f"🟢 Bid: {bid:.2f}\n"
-            f"🔴 Ask: {ask:.2f}\n"
-            f"📊 تغير اليوم: {pct:+.2f}%\n"
-            f"📡 حالة السوق: {market_state}\n"
-            f"⚡ عمر السعر: {quote_age} ثانية\n"
-            f"🛰️ المصدر: {tick.get('source', 'غير معروف')}\n"
-            f"🕐 دمشق: {datetime.now(DAMASCUS).strftime('%Y-%m-%d %I:%M:%S %p')}"
+            "🥇 XAUUSD\n\n"
+            f"💰 السعر اللحظي: {current:.2f}\n"
+            f"📊 التغير اليومي: {day_change:+.2f}%\n"
+            f"📡 حالة السوق: "
+            f"{'🟢 مفتوح' if market_state == 'open' else '🟡 ' + market_state}\n"
+            f"⚡ عمر السعر: {age:.0f} ثانية\n"
+            f"🕐 دمشق: "
+            f"{datetime.now(DAMASCUS).strftime('%Y-%m-%d %I:%M:%S %p')}"
         )
+
         await command_reply(update, "price", text)
+
     except Exception as e:
-        await safe_reply(update, f"❌ تعذر الحصول على السعر اللحظي: {e}")
+        await safe_reply(
+            update,
+            f"❌ تعذر الحصول على السعر اللحظي: {e}"
+        )
 
 
 async def levels(update: Update, context: ContextTypes.DEFAULT_TYPE):
