@@ -1024,35 +1024,34 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def get_live_price():
-    """Get the live XAUUSD quote separately from OHLC candles.
+async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await command_lock(update, "price"):
+        return
 
-    Biquote documents /api/XAUUSD as the REST quote endpoint and exposes
-    `mid` and `dayDiffPercent`. This function never falls back to OHLC.
-    """
-    url = "https://biquote.io/api/XAUUSD"
-    response = requests.get(url, timeout=10)
-    response.raise_for_status()
-    data = response.json()
+    try:
+        live = await get_live_price()
 
-    current = safe_float(data.get("mid"), None)
-    if current is None or current <= 0:
-        raise ValueError("مصدر السعر اللحظي لم يُرجع mid صالحًا")
+        current = live["price"]
+        change = live["day_diff"]
+        pct = live["day_pct"]
 
-    day_pct = safe_float(data.get("dayDiffPercent"), None)
-    day_diff = safe_float(data.get("dayDiff"), None)
+        text = (
+            "🥇 XAUUSD\n\n"
+            f"💰 السعر اللحظي: {current:.2f}\n"
+            f"📊 التغير: {change:+.2f} ({pct:+.2f}%)\n"
+            f"🕐 دمشق: "
+            f"{datetime.now(DAMASCUS).strftime('%Y-%m-%d %I:%M:%S %p')}"
+        )
 
-    if day_pct is None:
-        day_pct = 0.0
-    if day_diff is None:
-        day_diff = current * day_pct / 100.0
+        await command_reply(update, "price", text)
 
-    return {
-        "price": current,
-        "day_diff": day_diff,
-        "day_pct": day_pct,
-        "raw": data,
-    }
+    except Exception as e:
+        await safe_reply(
+            update,
+            "❌ تعذر الحصول على السعر اللحظي.\n"
+            "🚫 لم يتم استخدام OHLC كبديل حتى لا يظهر سعر قديم على أنه لحظي.\n"
+            f"السبب: {e}"
+        )
 
 
 async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
