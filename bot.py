@@ -15,7 +15,7 @@ from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
 # =========================================================
-# XAU SMART TRADER v16.0
+# XAU SMART TRADER v16.3
 # =========================================================
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -55,7 +55,7 @@ logger = logging.getLogger(__name__)
 DATA_CACHE = {}
 SUBSCRIBERS = set()
 COMMAND_LOCKS = {}
-COMMAND_MESSAGES = {}  # (chat_id, command) -> list of bot message_ids
+COMMAND_MESSAGES = {}  # (chat_id, command) -> last bot message_id
 LAST_AUTO_SIGNAL = {}
 LAST_AUTO_TIME = {}
 APPLICATION = None
@@ -72,14 +72,14 @@ WEEKLY_REPORT_WEEK = None
 
 @app.route("/", methods=["GET", "HEAD"])
 def home():
-    return "XAU SMART TRADER v16.0 - OK", 200
+    return "XAU SMART TRADER v16.3 - OK", 200
 
 
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({
         "status": "ok",
-        "bot": "XAU SMART TRADER v16.0",
+        "bot": "XAU SMART TRADER v16.3",
         "time": datetime.now(DAMASCUS).isoformat()
     }), 200
 
@@ -133,95 +133,6 @@ def get_bars(interval, limit=300):
 
     DATA_CACHE[key] = (now, df.copy())
     return df
-
-
-def _first_numeric(data, keys):
-    if not isinstance(data, dict):
-        return None
-    for key in keys:
-        value = safe_float(data.get(key), None)
-        if value is not None and value > 0:
-            return value
-    return None
-
-
-def _extract_live_price(data):
-    # Accept the common Biquote shapes without ever using OHLC candles.
-    price = _first_numeric(data, ("mid", "price", "last"))
-    if price is not None:
-        return price
-
-    if isinstance(data, dict):
-        for container in ("quote", "data", "tick", "result"):
-            nested = data.get(container)
-            if isinstance(nested, dict):
-                price = _first_numeric(nested, ("mid", "price", "last"))
-                if price is not None:
-                    return price
-                bid = _first_numeric(nested, ("bid",))
-                ask = _first_numeric(nested, ("ask",))
-                if bid is not None and ask is not None:
-                    return (bid + ask) / 2.0
-
-        bid = _first_numeric(data, ("bid",))
-        ask = _first_numeric(data, ("ask",))
-        if bid is not None and ask is not None:
-            return (bid + ask) / 2.0
-
-    return None
-
-
-def _extract_day_change(data):
-    if not isinstance(data, dict):
-        return 0.0
-    return _first_numeric(data, ("dayDiff", "change", "changeValue")) or 0.0
-
-
-def _extract_day_percent(data):
-    if not isinstance(data, dict):
-        return 0.0
-    value = _first_numeric(data, ("dayDiffPercent", "dayPct", "changePercent", "percent"))
-    return value if value is not None else 0.0
-
-
-def get_live_price():
-    """Fetch the live XAUUSD quote only from Biquote's quote endpoint.
-
-    IMPORTANT: OHLC candles are never used as a fallback here. If the live
-    quote is unavailable or invalid, an exception is raised so the user sees
-    that the live price is unavailable instead of receiving an old candle.
-
-    This function is intentionally synchronous because price() runs it with
-    asyncio.to_thread(). This prevents the 'coroutine was never awaited'
-    RuntimeWarning that affected the previous v16 build.
-    """
-    url = f"https://biquote.io/api/{SYMBOL}"
-    response = requests.get(
-        url,
-        params={"allowStale": "false"},
-        timeout=10,
-    )
-    response.raise_for_status()
-    data = response.json()
-
-    price = _extract_live_price(data)
-    if price is None or price <= 0:
-        raise ValueError("مصدر السعر المباشر لم يُرجع سعرًا صالحًا")
-
-    day_diff = _extract_day_change(data)
-    day_pct = _extract_day_percent(data)
-
-    # If only the percentage is supplied, derive the displayed day change.
-    if day_diff == 0.0 and day_pct != 0.0:
-        day_diff = price * day_pct / 100.0
-
-    return {
-        "price": price,
-        "day_diff": day_diff,
-        "day_pct": day_pct,
-        "source": "Biquote Live Quote",
-        "raw": data,
-    }
 
 
 # =========================================================
@@ -1001,7 +912,11 @@ async def weekly_job(context: ContextTypes.DEFAULT_TYPE):
 # =========================================================
 
 async def command_lock(update, command):
-    """Allow the command and remove ALL previous results for that command."""
+    """Allow the command and remove its previous bot result.
+
+    This is intentionally per-command: a new Quick Analysis replaces only the
+    previous Quick Analysis, while Daily/Weekly/Scalp/etc. keep their own slot.
+    """
     chat_id = update.effective_chat.id
     key = (chat_id, command)
     now = time.time()
@@ -1012,48 +927,36 @@ async def command_lock(update, command):
 
     COMMAND_LOCKS[key] = now
 
-    old_message_ids = COMMAND_MESSAGES.get(key, [])
-    if APPLICATION is not None:
-        for message_id in list(old_message_ids):
-            try:
-                await APPLICATION.bot.delete_message(
-                    chat_id=chat_id,
-                    message_id=message_id
-                )
-            except Exception as exc:
-                logger.debug(
-                    "Old command message could not be deleted (%s): %s",
-                    message_id, exc
-                )
+    old_message_id = COMMAND_MESSAGES.get(key)
+    if old_message_id and APPLICATION is not None:
+        try:
+            await APPLICATION.bot.delete_message(chat_id=chat_id, message_id=old_message_id)
+        except Exception as exc:
+            # Telegram can reject deletion when the message is already gone.
+            logger.debug("Old command message could not be deleted: %s", exc)
 
-    COMMAND_MESSAGES[key] = []
     return True
 
 
 async def command_reply(update, command, text):
-    """Send a command result and remember it for complete replacement."""
+    """Send a command result and remember it as the replaceable message."""
     chat_id = update.effective_chat.id
     msg = await update.message.reply_text(text)
-    COMMAND_MESSAGES[(chat_id, command)] = [msg.message_id]
+    COMMAND_MESSAGES[(chat_id, command)] = msg.message_id
     return msg
 
 
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    subscribed = update.effective_chat.id in SUBSCRIBERS
-    auto_button = (
-        "🟢 الصفقة التلقائية: تشغيل"
-        if subscribed else
-        "🔴 الصفقة التلقائية: إيقاف"
-    )
-    state = "🟢 مفعّلة" if subscribed else "🔴 متوقفة"
     keyboard = [
         ["📊 التحليل اليومي", "⚡ التحليل السريع"],
         ["📅 التحليل الأسبوعي", "🕵️ Secret Scalp"],
         ["🎯 صفقة الآن", "💰 سعر الذهب"],
-        [auto_button],
+        ["🔔 تفعيل الصفقات التلقائية", "🔕 إيقاف الصفقات التلقائية"],
         ["🌍 الأسواق", "🟢 حالة النظام"],
         ["🆘 الدعم"],
     ]
+    subscribed = update.effective_chat.id in SUBSCRIBERS
+    state = "🟢 مفعّلة" if subscribed else "🔕 متوقفة"
     text = (
         "🤖 XAU SMART TRADER\n"
         "🥇 محرك XAUUSD متعدد العوامل\n\n"
@@ -1084,8 +987,6 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🎯 صفقة الآن": trade,
         "📍 الدعوم والمقاومات": levels,
         "💰 سعر الذهب": price,
-        "🟢 الصفقة التلقائية: تشغيل": toggle_auto,
-        "🔴 الصفقة التلقائية: إيقاف": toggle_auto,
         "🔔 تفعيل الصفقات التلقائية": subscribe,
         "🔕 إيقاف الصفقات التلقائية": unsubscribe,
         "🌍 الأسواق": markets,
@@ -1102,7 +1003,7 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     subscribed = update.effective_chat.id in SUBSCRIBERS
     await update.message.reply_text(
-        "🤖 XAU SMART TRADER v16.0\n\n"
+        "🤖 XAU SMART TRADER v16.3\n\n"
         "🟢 النظام: يعمل\n"
         "🌐 Webhook: يعمل\n"
         "📡 البيانات: متاحة\n"
@@ -1123,27 +1024,78 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def get_live_price():
+    """جلب السعر اللحظي الحقيقي من Biquote دون استخدام OHLC كبديل.
+
+    Biquote يعيد 404 عند استخدام allowStale=false إذا كان آخر اقتباس
+    أقدم من خمس دقائق. لذلك نطلب الاقتباس العادي ثم نتحقق نحن من
+    marketState/stale/quoteAgeSeconds حتى لا يظهر سعر قديم على أنه لحظي.
+    """
+    url = f"https://biquote.io/api/{SYMBOL}"
+
+    response = requests.get(url, timeout=10)
+    response.raise_for_status()
+    data = response.json()
+
+    if not isinstance(data, dict):
+        raise ValueError("مصدر السعر اللحظي أعاد استجابة غير صالحة")
+
+    # لا نقبل سعرًا قديمًا أو سوقًا مغلقًا كسعر لحظي.
+    market_state = str(data.get("marketState", "")).lower()
+    stale = bool(data.get("stale", False))
+    age_raw = data.get("quoteAgeSeconds")
+    try:
+        age = float(age_raw) if age_raw is not None else 0.0
+    except (TypeError, ValueError):
+        age = 0.0
+
+    if market_state == "closed":
+        raise ValueError("سوق الذهب مغلق أو لا يوجد اقتباس لحظي حالي")
+    if stale:
+        raise ValueError("آخر اقتباس أصبح قديمًا")
+    if age > 300:
+        raise ValueError(f"عمر الاقتباس {age:.0f} ثانية، وليس لحظيًا")
+
+    current = safe_float(data.get("mid"), None)
+    if current is None or current <= 0:
+        bid = safe_float(data.get("bid"), None)
+        ask = safe_float(data.get("ask"), None)
+        if bid is not None and ask is not None and bid > 0 and ask > 0:
+            current = (bid + ask) / 2.0
+
+    if current is None or current <= 0:
+        raise ValueError("مصدر السعر اللحظي لم يُرجع mid/bid/ask صالحًا")
+
+    day_pct = safe_float(data.get("dayDiffPercent"), 0.0)
+    day_diff = safe_float(data.get("dayDiff"), None)
+    if day_diff is None:
+        day_diff = current * day_pct / 100.0
+
+    return {
+        "price": current,
+        "day_diff": day_diff,
+        "day_pct": day_pct,
+        "source": "Biquote Live Quote",
+        "quote_age": age,
+        "market_state": market_state or "open",
+        "raw": data,
+    }
+
+
 async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await command_lock(update, "price"):
         return
     try:
-        # get_live_price is synchronous; run it outside the Telegram event loop.
         quote = await asyncio.to_thread(get_live_price)
         current = quote["price"]
         change = quote["day_diff"]
         pct = quote["day_pct"]
-
-        raw = quote.get("raw", {})
-        market_state = raw.get("marketState", raw.get("status", "غير معروف")) if isinstance(raw, dict) else "غير معروف"
-        quote_age = raw.get("quoteAgeSeconds", "غير متاح") if isinstance(raw, dict) else "غير متاح"
-
         text = (
             "🥇 XAUUSD — السعر اللحظي\n\n"
             f"💰 السعر: {current:.2f}\n"
             f"📊 التغير اليومي: {change:+.2f} ({pct:+.2f}%)\n"
-            f"📡 حالة السوق: {market_state}\n"
-            f"⚡ عمر السعر: {quote_age} ثانية\n"
-            "🛰️ المصدر: Biquote Live Quote\n"
+            f"🟢 المصدر: Biquote Live Quote\n"
+            f"⚡ عمر الاقتباس: {quote.get('quote_age', 0):.0f} ثانية\n"
             f"🕐 دمشق: {datetime.now(DAMASCUS).strftime('%Y-%m-%d %I:%M:%S %p')}"
         )
         await command_reply(update, "price", text)
@@ -1165,11 +1117,11 @@ async def levels(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await command_reply(update, "levels",
             "📍 XAUUSD — مستويات رئيسية\n\n"
             f"💰 السعر: {x['current']:.2f}\n\n"
-            f"🟢 دعم 1: {x['support1']:.2f}\n"
-            f"🟢 دعم 2: {x['support2']:.2f}\n"
+            f"🟢 S1: {x['support1']:.2f}\n"
+            f"🟢 S2: {x['support2']:.2f}\n"
             f"🟢 S3: {x['support3']:.2f}\n\n"
-            f"🔴 مقاومة 1: {x['resistance1']:.2f}\n"
-            f"🔴 مقاومة 2: {x['resistance2']:.2f}\n"
+            f"🔴 R1: {x['resistance1']:.2f}\n"
+            f"🔴 R2: {x['resistance2']:.2f}\n"
             f"🔴 R3: {x['resistance3']:.2f}\n\n"
             f"🎯 دقة المنطقة: S1 لمس {x.get('support_touches', 0)} / R1 لمس {x.get('resistance_touches', 0)}\n"
             "⚠️ المستويات مناطق وليست أرقامًا سحرية؛ التأكيد السعري والحجمي مطلوب قبل التنفيذ."
@@ -1249,7 +1201,7 @@ async def quick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         engine = mtf_engine(m15, m5, m1)
         levels = calculate_support_resistance(m5_df, 80)
         result = (
-            "⚡ XAU SMART TRADER v16.0 — التحليل السريع\n\n"
+            "⚡ XAU SMART TRADER v16.3 — التحليل السريع\n\n"
             "📖 قراءة أولية\n"
             f"الاتجاه الحالي: {m15['trend']}\n"
             f"منطقة الاهتمام: دعم {levels['support1']:.2f} / مقاومة {levels['resistance1']:.2f}\n"
@@ -1336,7 +1288,7 @@ async def trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
         label = "💯 إشارة صارمة 100%" if engine["perfect"] else "🎯 دقة عالية 73%+"
 
         await command_reply(update, "trade",
-            "🤖 XAU SMART TRADER v16.0\n\n"
+            "🤖 XAU SMART TRADER v16.3\n\n"
             f"{label}\n\n"
             f"📈 الاتجاه: {'🟢 شراء' if engine['direction']=='BUY' else '🔴 بيع'}\n"
             f"💪 التوافق: {engine['score']}%\n"
@@ -1346,7 +1298,7 @@ async def trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🛑 وقف الخسارة: {sl:.2f}\n"
             f"🎯 الهدف الأول: {tp1:.2f}\n"
             f"🎯 الهدف الثاني: {tp2:.2f}\n\n"
-            f"🧱 دعم 1: {levels['support1']:.2f}\n"
+            f"🧱 S1: {levels['support1']:.2f}\n"
             f"🔴 R1: {levels['resistance1']:.2f}\n\n"
             "⚠️ الإشارة تحليلية وليست ضمانًا للربح."
         )
@@ -1420,7 +1372,7 @@ async def auto_trade_loop():
                             continue
 
                         text = (
-                            "🚨 XAU SMART TRADER v16.0\n\n"
+                            "🚨 XAU SMART TRADER v16.3\n\n"
                             f"{'💯 إشارة صارمة 100%' if signal['perfect'] else '🕵️ Secret Scalp 85%+'}\n\n"
                             f"📈 الاتجاه: {'🟢 شراء' if signal['direction']=='BUY' else '🔴 بيع'}\n"
                             f"💪 التوافق: {signal['confidence']}%\n"
@@ -1447,43 +1399,20 @@ async def auto_trade_loop():
         await asyncio.sleep(AUTO_CHECK_SECONDS)
 
 
-async def toggle_auto(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-
-    if chat_id in SUBSCRIBERS:
-        SUBSCRIBERS.discard(chat_id)
-        LAST_AUTO_SIGNAL.pop(chat_id, None)
-        LAST_AUTO_TIME.pop(chat_id, None)
-        state = "🔴 إيقاف"
-        message = "🔴 تم إيقاف الصفقات التلقائية."
-    else:
-        SUBSCRIBERS.add(chat_id)
-        state = "🟢 تشغيل"
-        message = (
-            "🟢 تم تشغيل الصفقات التلقائية.\n"
-            "لن تتراكم الإشارات المكررة، وتعمل داخل نافذة اليوم فقط."
-        )
-
-    await update.message.reply_text(message)
-    await show_main_menu(update, context)
-
-
 async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Compatibility for /subscribe.
     SUBSCRIBERS.add(update.effective_chat.id)
-    LAST_AUTO_SIGNAL.pop(update.effective_chat.id, None)
-    LAST_AUTO_TIME.pop(update.effective_chat.id, None)
-    await update.message.reply_text("🟢 تم تشغيل الصفقات التلقائية.")
-    await show_main_menu(update, context)
+    await update.message.reply_text(
+        "🟢 تم تفعيل الصفقات التلقائية.\n"
+        "لن تتراكم الإشارات المكررة، وتعمل داخل نافذة اليوم فقط.\n"
+        "🔕 /unsubscribe للإيقاف."
+    )
 
 
 async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Compatibility for /unsubscribe.
     SUBSCRIBERS.discard(update.effective_chat.id)
     LAST_AUTO_SIGNAL.pop(update.effective_chat.id, None)
     LAST_AUTO_TIME.pop(update.effective_chat.id, None)
-    await update.message.reply_text("🔴 تم إيقاف الصفقات التلقائية.")
-    await show_main_menu(update, context)
+    await update.message.reply_text("🔕 تم إيقاف الصفقات التلقائية.")
 
 
 # =========================================================
@@ -1587,7 +1516,7 @@ async def start_application():
     )
 
     BOT_STARTED = True
-    logger.info("XAU SMART TRADER v16.0 started: %s", WEBHOOK_URL)
+    logger.info("XAU SMART TRADER v16.3 started: %s", WEBHOOK_URL)
 
     # Daily/weekly scheduler. If JobQueue is unavailable in the installed
     # python-telegram-bot package, the explicit loops below still work.
