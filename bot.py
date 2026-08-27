@@ -667,6 +667,8 @@ def calculate_support_resistance(df, lookback=120, current_override=None):
             n = idx + 1
             if idx < len(zones):
                 z = zones[idx]
+                # Public keys used by the rest of the bot.
+                # Keep zone/level/low/high aliases for compatibility.
                 out[f"zone{n}"] = z
                 out[f"level{n}"] = z["mid"]
                 out[f"low{n}"] = z["low"]
@@ -683,8 +685,22 @@ def calculate_support_resistance(df, lookback=120, current_override=None):
         return out
 
     result = {"current": current, "atr": atr_v, "zone_radius": zone_radius}
-    result.update({f"support{k}": v for k, v in pack(supports).items()})
-    result.update({f"resistance{k}": v for k, v in pack(resistances).items()})
+    # Expose side-prefixed fields expected by formatting, entry and reports.
+    # Previous v16.7 returned supportlevel1/supportstrength1, while callers
+    # requested support1; that mismatch caused every S/R value to show as
+    # "غير متوفرة" and could break build_entry_zone().
+    for side, zones in (("support", supports), ("resistance", resistances)):
+        packed = pack(zones)
+        for idx in range(1, 4):
+            z = packed.get(f"zone{idx}")
+            result[f"{side}{idx}"] = z["mid"] if z else None
+            result[f"{side}low{idx}"] = z["low"] if z else None
+            result[f"{side}high{idx}"] = z["high"] if z else None
+            result[f"{side}strength{idx}"] = z["strength"] if z else 0
+            result[f"{side}touches{idx}"] = z["touches"] if z else 0
+            result[f"{side}zone{idx}"] = z
+            # Generic aliases retained for compatibility.
+            result[f"{side}level{idx}"] = result[f"{side}{idx}"]
     # Backward-compatible touch fields.
     result["support_touches"] = supports[0]["touches"] if supports else 0
     result["resistance_touches"] = resistances[0]["touches"] if resistances else 0
