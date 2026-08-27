@@ -15,7 +15,7 @@ from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
 # =========================================================
-# XAU SMART TRADER v16.6
+# XAU SMART TRADER v16.7
 # =========================================================
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -74,14 +74,14 @@ WEEKLY_REPORT_WEEK = None
 
 @app.route("/", methods=["GET", "HEAD"])
 def home():
-    return "XAU SMART TRADER v16.6 - OK", 200
+    return "XAU SMART TRADER v16.7 - OK", 200
 
 
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({
         "status": "ok",
-        "bot": "XAU SMART TRADER v16.6",
+        "bot": "XAU SMART TRADER v16.7",
         "time": datetime.now(DAMASCUS).isoformat()
     }), 200
 
@@ -534,69 +534,161 @@ def analyze_frame(df, scalp=False):
 # LEVELS / ENTRY
 # =========================================================
 
-def calculate_support_resistance(df, lookback=80, current_override=None):
-    """Build S/R from confirmed swing pivots, clustered by ATR.
+def calculate_support_resistance(df, lookback=120, current_override=None):
+    """Professional S/R zones based only on confirmed price evidence.
 
-    This avoids treating every candle high/low as an independent level, which
-    was the reason v15 could output very noisy levels such as 4610.38/4611.33.
+    No synthetic ATR levels are created. Each returned zone is backed by
+    confirmed swing pivots and scored from 0-100 using touches, rejection,
+    volume, recency, Fibonacci confluence and distance to live price.
     """
+    if df is None or len(df) < 30:
+        raise ValueError("بيانات غير كافية لبناء مناطق S/R")
+
     x = df.tail(min(lookback, len(df))).copy().reset_index(drop=True)
-    current = safe_float(current_override) if current_override is not None else safe_float(x["close"].iloc[-1])
-    atr_v = max(safe_float(atr(x["high"], x["low"], x["close"], 14).iloc[-1]), 0.05)
-    radius = atr_v * S_R_CLUSTER_ATR
+    current = safe_float(current_override, None)
+    if current is None or current <= 0:
+        current = safe_float(x["close"].iloc[-1], None)
+    if current is None or current <= 0:
+        raise ValueError("السعر الحالي غير صالح")
 
-    candidates_support, candidates_resistance = [], []
-    for i in range(2, len(x) - 2):
-        h = safe_float(x["high"].iloc[i])
-        l = safe_float(x["low"].iloc[i])
-        if h >= safe_float(x["high"].iloc[i-2:i+3].max()):
-            candidates_resistance.append(h)
-        if l <= safe_float(x["low"].iloc[i-2:i+3].min()):
-            candidates_support.append(l)
+    atr_v = max(safe_float(atr(x["high"], x["low"], x["close"], 14).iloc[-1]), 0.01)
+    zone_radius = max(atr_v * 0.30, current * 0.00035)
+    min_separation = max(atr_v * 0.55, current * 0.00060)
 
-    def cluster(values):
-        values = sorted(values)
+    vol = x["tickVolume"].astype(float)
+    vol_base = max(safe_float(vol.tail(30).mean(), 1.0), 1.0)
+    fib = fibonacci_levels(x, min(100, len(x)))
+
+    def is_swing_low(i):
+        return i >= 2 and i <= len(x)-3 and safe_float(x["low"].iloc[i]) <= safe_float(x["low"].iloc[i-2:i+3].min())
+
+    def is_swing_high(i):
+        return i >= 2 and i <= len(x)-3 and safe_float(x["high"].iloc[i]) >= safe_float(x["high"].iloc[i-2:i+3].max())
+
+    def make_candidates(side):
+        candidates = []
+        for i in range(2, len(x)-2):
+            if (side == "support" and not is_swing_low(i)) or (side == "resistance" and not is_swing_high(i)):
+                continue
+            price = safe_float(x["low"].iloc[i] if side == "support" else x["high"].iloc[i])
+            if side == "support" and price >= current:
+                continue
+            if side == "resistance" and price <= current:
+                continue
+
+            start = max(0, i-2)
+            end = min(len(x), i+3)
+            local = x.iloc[start:end]
+            touches = 0
+            rejection = 0.0
+            for j in range(len(x)):
+                level_distance = abs(safe_float(x["low"].iloc[j] if side == "support" else x["high"].iloc[j]) - price)
+                if level_distance <= zone_radius:
+                    touches += 1
+                    wf = candle_wick_features(x.iloc[j])
+                    rejection = max(rejection, wf["lower_ratio"] if side == "support" else wf["upper_ratio"])
+
+            age = len(x) - 1 - i
+            recency = max(0.0, 1.0 - age / max(len(x), 1))
+            local_vol = safe_float(local["tickVolume"].mean(), vol_base) / vol_base
+            volume_score = min(local_vol / 1.50, 1.0)
+            rejection_score = min(rejection / 0.60, 1.0)
+            touch_score = min(touches / 4.0, 1.0)
+            distance_score = max(0.0, 1.0 - abs(current-price) / (atr_v * 5.0))
+            fib_score = 0.0
+            if fib:
+                nearest_fib = min(fib.values(), key=lambda z: abs(z-price))
+                if abs(nearest_fib-price) <= zone_radius * 1.5:
+                    fib_score = 1.0
+
+            strength = round(100 * (
+                touch_score * 0.30 + rejection_score * 0.20 +
+                volume_score * 0.15 + recency * 0.15 +
+                distance_score * 0.10 + fib_score * 0.10
+            ))
+            candidates.append({
+                "price": price, "touches": touches, "strength": max(0, min(strength, 100)),
+                "rejection": rejection, "volume_ratio": local_vol,
+                "recency": recency, "fib": bool(fib_score),
+            })
+        return candidates
+
+    def cluster(candidates):
         clusters = []
-        for value in values:
-            if not clusters or abs(value - clusters[-1][-1]) > radius:
-                clusters.append([value])
+        for c in sorted(candidates, key=lambda z: z["price"]):
+            target = None
+            for group in clusters:
+                center = sum(v["price"] for v in group) / len(group)
+                if abs(c["price"] - center) <= zone_radius:
+                    target = group
+                    break
+            if target is None:
+                clusters.append([c])
             else:
-                clusters[-1].append(value)
-        # Weighted by number of touches; newest/nearby level gets preference later.
-        return [(sum(c)/len(c), len(c)) for c in clusters]
+                target.append(c)
 
-    supports = [(v, touches) for v, touches in cluster(candidates_support) if v < current]
-    resistances = [(v, touches) for v, touches in cluster(candidates_resistance) if v > current]
+        zones = []
+        for group in clusters:
+            total_weight = sum(max(v["strength"], 1) for v in group)
+            center = sum(v["price"] * max(v["strength"], 1) for v in group) / total_weight
+            half = max(zone_radius * 0.55, atr_v * 0.10)
+            strength = min(100, max(v["strength"] for v in group) + min(15, (len(group)-1)*5))
+            zones.append({
+                "low": center-half, "high": center+half, "mid": center,
+                "strength": int(strength),
+                "touches": max(v["touches"] for v in group),
+                "rejection": max(v["rejection"] for v in group),
+                "volume_ratio": max(v["volume_ratio"] for v in group),
+                "fib": any(v["fib"] for v in group),
+            })
+        return zones
 
-    supports.sort(key=lambda z: (abs(current-z[0]), -z[1]))
-    resistances.sort(key=lambda z: (abs(z[0]-current), -z[1]))
+    supports = cluster(make_candidates("support"))
+    resistances = cluster(make_candidates("resistance"))
 
-    def fill(items, side):
-        out = [v for v, _ in items]
-        step = max(atr_v * 0.85, 0.10)
-        if side == 'support':
-            base = out[-1] if out else current - step
-            while len(out) < 3:
-                base -= step
-                out.append(base)
-        else:
-            base = out[-1] if out else current + step
-            while len(out) < 3:
-                base += step
-                out.append(base)
-        return out[:3]
+    def select(zones, side):
+        zones = [z for z in zones if z["strength"] >= 35]
+        zones.sort(key=lambda z: (abs(current-z["mid"]), -z["strength"]))
+        selected = []
+        for z in zones:
+            if any(abs(z["mid"]-q["mid"]) < min_separation for q in selected):
+                continue
+            selected.append(z)
+            if len(selected) == 3:
+                break
+        return selected
 
-    s = fill(supports, 'support')
-    r = fill(resistances, 'resistance')
-    return {
-        "current": current,
-        "support1": s[0], "support2": s[1], "support3": s[2],
-        "resistance1": r[0], "resistance2": r[1], "resistance3": r[2],
-        "atr": atr_v,
-        "support_touches": supports[0][1] if supports else 0,
-        "resistance_touches": resistances[0][1] if resistances else 0
-    }
+    supports = select(supports, "support")
+    resistances = select(resistances, "resistance")
 
+    def pack(zones):
+        out = {}
+        for idx in range(3):
+            n = idx + 1
+            if idx < len(zones):
+                z = zones[idx]
+                out[f"zone{n}"] = z
+                out[f"level{n}"] = z["mid"]
+                out[f"low{n}"] = z["low"]
+                out[f"high{n}"] = z["high"]
+                out[f"strength{n}"] = z["strength"]
+                out[f"touches{n}"] = z["touches"]
+            else:
+                out[f"zone{n}"] = None
+                out[f"level{n}"] = None
+                out[f"low{n}"] = None
+                out[f"high{n}"] = None
+                out[f"strength{n}"] = 0
+                out[f"touches{n}"] = 0
+        return out
+
+    result = {"current": current, "atr": atr_v, "zone_radius": zone_radius}
+    result.update({f"support{k}": v for k, v in pack(supports).items()})
+    result.update({f"resistance{k}": v for k, v in pack(resistances).items()})
+    # Backward-compatible touch fields.
+    result["support_touches"] = supports[0]["touches"] if supports else 0
+    result["resistance_touches"] = resistances[0]["touches"] if resistances else 0
+    return result
 
 def build_entry_zone(direction, current, levels, atr_value):
     atr_value = max(safe_float(atr_value), 0.01)
@@ -791,11 +883,15 @@ def build_trade(direction, df, current_override=None):
     levels = calculate_support_resistance(df, 80)
 
     if direction == "BUY":
+        if levels.get("support1") is None:
+            raise ValueError("لا توجد منطقة دعم حقيقية كافية لبناء صفقة شراء")
         entry = current
         sl = min(entry - atr_v * 1.20, levels["support1"] - atr_v * 0.10)
         tp1 = entry + atr_v * 1.30
         tp2 = entry + atr_v * 2.00
     else:
+        if levels.get("resistance1") is None:
+            raise ValueError("لا توجد منطقة مقاومة حقيقية كافية لبناء صفقة بيع")
         entry = current
         sl = max(entry + atr_v * 1.20, levels["resistance1"] + atr_v * 0.10)
         tp1 = entry - atr_v * 1.30
@@ -807,6 +903,11 @@ def build_trade(direction, df, current_override=None):
 # =========================================================
 # FORMATTING
 # =========================================================
+
+def format_sr(levels, key):
+    value = levels.get(key)
+    return f"{value:.2f}" if value is not None else "غير متوفرة"
+
 
 def warning_text(items):
     if not items:
@@ -880,12 +981,12 @@ def build_weekly_report():
         f"حالة السوق: {dr['regime']}\n"
         f"نسبة التوافق: {score}%\n\n"
         "🧱 المستويات الأسبوعية\n"
-        f"الدعم الأقرب: {levels['support1']:.2f}\n"
-        f"الدعم التالي: {levels['support2']:.2f}\n"
-        f"الدعم الثالث: {levels['support3']:.2f}\n"
-        f"المقاومة الأقرب: {levels['resistance1']:.2f}\n"
-        f"المقاومة التالية: {levels['resistance2']:.2f}\n"
-        f"المقاومة الثالثة: {levels['resistance3']:.2f}\n\n"
+        f"الدعم الأقرب: {format_sr(levels, 'support1')}\n"
+        f"الدعم التالي: {format_sr(levels, 'support2')}\n"
+        f"الدعم الثالث: {format_sr(levels, 'support3')}\n"
+        f"المقاومة الأقرب: {format_sr(levels, 'resistance1')}\n"
+        f"المقاومة التالية: {format_sr(levels, 'resistance2')}\n"
+        f"المقاومة الثالثة: {format_sr(levels, 'resistance3')}\n\n"
         "🟢 السيناريو الإيجابي\n"
         "يحتاج ثباتًا فوق المقاومة/الدعم المحوري مع استمرار الزخم والحجم.\n\n"
         "🔴 السيناريو السلبي\n"
@@ -1007,7 +1108,7 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     subscribed = update.effective_chat.id in SUBSCRIBERS
     await update.message.reply_text(
-        "🤖 XAU SMART TRADER v16.6\n\n"
+        "🤖 XAU SMART TRADER v16.7\n\n"
         "🟢 النظام: يعمل\n"
         "🌐 Webhook: يعمل\n"
         "📡 البيانات: متاحة\n"
@@ -1191,12 +1292,12 @@ async def levels(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await command_reply(update, "levels",
             "📍 XAUUSD — مستويات رئيسية\n\n"
             f"💰 السعر: {x['current']:.2f}\n\n"
-            f"🟢 S1: {x['support1']:.2f}\n"
-            f"🟢 S2: {x['support2']:.2f}\n"
-            f"🟢 S3: {x['support3']:.2f}\n\n"
-            f"🔴 R1: {x['resistance1']:.2f}\n"
-            f"🔴 R2: {x['resistance2']:.2f}\n"
-            f"🔴 R3: {x['resistance3']:.2f}\n\n"
+            f"🟢 S1: {format_sr(x, 'support1')} | قوة {x['supportstrength1']}/100\n"
+            f"🟢 S2: {format_sr(x, 'support2')} | قوة {x['supportstrength2']}/100\n"
+            f"🟢 S3: {format_sr(x, 'support3')} | قوة {x['supportstrength3']}/100\n\n"
+            f"🔴 R1: {format_sr(x, 'resistance1')} | قوة {x['resistancestrength1']}/100\n"
+            f"🔴 R2: {format_sr(x, 'resistance2')} | قوة {x['resistancestrength2']}/100\n"
+            f"🔴 R3: {format_sr(x, 'resistance3')} | قوة {x['resistancestrength3']}/100\n\n"
             f"🎯 دقة المنطقة: S1 لمس {x.get('support_touches', 0)} / R1 لمس {x.get('resistance_touches', 0)}\n"
             "⚠️ المستويات مناطق وليست أرقامًا سحرية؛ التأكيد السعري والحجمي مطلوب قبل التنفيذ."
         )
@@ -1248,10 +1349,10 @@ async def daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"4. حالة السوق: {dr['regime']}\n"
             f"5. نسبة التوافق: {score}%\n\n"
             "📍 المناطق المهمة\n"
-            f"1. الدعم الأقرب: {levels['support1']:.2f}\n"
-            f"2. المقاومة الأقرب: {levels['resistance1']:.2f}\n"
-            f"3. الدعوم التالية: {levels['support2']:.2f} / {levels['support3']:.2f}\n"
-            f"4. المقاومات التالية: {levels['resistance2']:.2f} / {levels['resistance3']:.2f}\n"
+            f"1. الدعم الأقرب: {format_sr(levels, 'support1')}\n"
+            f"2. المقاومة الأقرب: {format_sr(levels, 'resistance1')}\n"
+            f"3. الدعوم التالية: {format_sr(levels, 'support2')} / {format_sr(levels, 'support3')}\n"
+            f"4. المقاومات التالية: {format_sr(levels, 'resistance2')} / {format_sr(levels, 'resistance3')}\n"
             f"5. منطقة السيولة: {dr['liquidity']}\n\n"
             "🟢 السيناريو الإيجابي\n"
             "استمرار فوق الدعم المحوري + تحسن الزخم والحجم + عدم ظهور تعارض هيكلي.\n\n"
@@ -1280,11 +1381,11 @@ async def quick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         live_current = quote["price"]
         levels = calculate_support_resistance(m5_df, 80, live_current)
         result = (
-            "⚡ XAU SMART TRADER v16.6 — التحليل السريع\n\n"
+            "⚡ XAU SMART TRADER v16.7 — التحليل السريع\n\n"
             "📖 قراءة أولية\n"
             f"💰 السعر اللحظي: {live_current:.2f}\n"
             f"الاتجاه الحالي: {m15['trend']}\n"
-            f"منطقة الاهتمام: دعم {levels['support1']:.2f} / مقاومة {levels['resistance1']:.2f}\n"
+            f"منطقة الاهتمام: دعم {format_sr(levels, 'support1')} ({levels['supportstrength1']}/100) / مقاومة {format_sr(levels, 'resistance1')} ({levels['resistancestrength1']}/100)\n"
             f"نسبة التوافق: {engine['score']}%\n\n"
             "🕵️ المحرك متعدد الفريمات\n"
             f"سياق M15: {m15['direction']} — {m15['score']}%\n"
@@ -1324,7 +1425,7 @@ async def scalp(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📖 قراءة أولية\n"
             f"💰 السعر اللحظي: {live_current:.2f}\n"
             f"الاتجاه الحالي: {m15['trend']}\n"
-            f"منطقة الاهتمام: دعم {levels['support1']:.2f} / مقاومة {levels['resistance1']:.2f}\n"
+            f"منطقة الاهتمام: دعم {format_sr(levels, 'support1')} ({levels['supportstrength1']}/100) / مقاومة {format_sr(levels, 'resistance1')} ({levels['resistancestrength1']}/100)\n"
             f"نسبة التوافق: {engine['score']}%\n\n"
             "🕵️ المحرك متعدد الفريمات\n"
             f"سياق M15: {m15['direction']} — {m15['score']}%\n"
@@ -1372,7 +1473,7 @@ async def trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
         label = "💯 إشارة صارمة 100%" if engine["perfect"] else "🎯 دقة عالية 73%+"
 
         await command_reply(update, "trade",
-            "🤖 XAU SMART TRADER v16.6\n\n"
+            "🤖 XAU SMART TRADER v16.7\n\n"
             f"{label}\n\n"
             f"💰 السعر اللحظي: {live['price']:.2f}\n"
             f"📈 الاتجاه: {'🟢 شراء' if engine['direction']=='BUY' else '🔴 بيع'}\n"
@@ -1383,8 +1484,8 @@ async def trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🛑 وقف الخسارة: {sl:.2f}\n"
             f"🎯 الهدف الأول: {tp1:.2f}\n"
             f"🎯 الهدف الثاني: {tp2:.2f}\n\n"
-            f"🧱 S1: {levels['support1']:.2f}\n"
-            f"🔴 R1: {levels['resistance1']:.2f}\n\n"
+            f"🧱 S1: {format_sr(levels, 'support1')}\n"
+            f"🔴 R1: {format_sr(levels, 'resistance1')}\n\n"
             "⚠️ الإشارة تحليلية وليست ضمانًا للربح."
         )
     except Exception as e:
@@ -1461,7 +1562,7 @@ async def auto_trade_loop():
                             continue
 
                         text = (
-                            "🚨 XAU SMART TRADER v16.6\n\n"
+                            "🚨 XAU SMART TRADER v16.7\n\n"
                             f"{'💯 إشارة صارمة 100%' if signal['perfect'] else '🕵️ Secret Scalp 85%+'}\n\n"
                             f"💰 السعر اللحظي: {signal['live_price']:.2f}\n"
                             f"📈 الاتجاه: {'🟢 شراء' if signal['direction']=='BUY' else '🔴 بيع'}\n"
@@ -1606,7 +1707,7 @@ async def start_application():
     )
 
     BOT_STARTED = True
-    logger.info("XAU SMART TRADER v16.6 started: %s", WEBHOOK_URL)
+    logger.info("XAU SMART TRADER v16.7 started: %s", WEBHOOK_URL)
 
     # Daily/weekly scheduler. If JobQueue is unavailable in the installed
     # python-telegram-bot package, the explicit loops below still work.
