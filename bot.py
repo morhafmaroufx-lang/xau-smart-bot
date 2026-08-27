@@ -34,6 +34,9 @@ DAMASCUS = ZoneInfo("Asia/Damascus")
 NEW_YORK = ZoneInfo("America/New_York")
 
 CACHE_SECONDS = 20
+# Minimum bars required per timeframe; price command can fall back to H1.
+MIN_BARS = 30
+S_R_CLUSTER_ATR = 0.35
 TRADE_THRESHOLD = 73
 STRICT_100_THRESHOLD = 99
 AUTO_CHECK_SECONDS = 60
@@ -52,7 +55,7 @@ logger = logging.getLogger(__name__)
 DATA_CACHE = {}
 SUBSCRIBERS = set()
 COMMAND_LOCKS = {}
-COMMAND_MESSAGES = {}  # (chat_id, command) -> last bot message_id
+COMMAND_MESSAGES = {}  # (chat_id, command) -> list of bot message_ids
 LAST_AUTO_SIGNAL = {}
 LAST_AUTO_TIME = {}
 APPLICATION = None
@@ -125,31 +128,26 @@ def get_bars(interval, limit=300):
 
     df = df.reset_index(drop=True)
 
-    if len(df) < 30:
+    if len(df) < MIN_BARS:
         raise ValueError(f"بيانات {interval} غير كافية")
 
     DATA_CACHE[key] = (now, df.copy())
     return df
 
 
-# =========================================================
-# LIVE PRICE
-# =========================================================
-
 def _first_numeric(data, keys):
     if not isinstance(data, dict):
         return None
     for key in keys:
-        value = data.get(key)
-        number = safe_float(value, default=float("nan"))
-        if np.isfinite(number) and number > 0:
-            return number
+        value = safe_float(data.get(key), None)
+        if value is not None and value > 0:
+            return value
     return None
 
 
 def _extract_live_price(data):
-    # Biquote may expose the quote as mid, bid/ask, or nested quote data.
-    price = _first_numeric(data, ("mid", "price", "last", "close"))
+    # Accept the common Biquote shapes without ever using OHLC candles.
+    price = _first_numeric(data, ("mid", "price", "last"))
     if price is not None:
         return price
 
@@ -157,79 +155,72 @@ def _extract_live_price(data):
         for container in ("quote", "data", "tick", "result"):
             nested = data.get(container)
             if isinstance(nested, dict):
-                price = _first_numeric(nested, ("mid", "price", "last", "close"))
+                price = _first_numeric(nested, ("mid", "price", "last"))
                 if price is not None:
                     return price
                 bid = _first_numeric(nested, ("bid",))
                 ask = _first_numeric(nested, ("ask",))
                 if bid is not None and ask is not None:
-                    return (bid + ask) / 2
+                    return (bid + ask) / 2.0
 
         bid = _first_numeric(data, ("bid",))
         ask = _first_numeric(data, ("ask",))
         if bid is not None and ask is not None:
-            return (bid + ask) / 2
-    return None
+            return (bid + ask) / 2.0
 
-
-def _signed_numeric(data, keys):
-    if not isinstance(data, dict):
-        return None
-    for key in keys:
-        value = data.get(key)
-        number = safe_float(value, default=float("nan"))
-        if np.isfinite(number):
-            return number
     return None
 
 
 def _extract_day_change(data):
     if not isinstance(data, dict):
         return 0.0
-    value = _signed_numeric(data, ("dayChange", "change", "change24h", "priceChange"))
-    if value is not None:
-        return value
-    for container in ("quote", "data", "tick", "result"):
-        nested = data.get(container) if isinstance(data, dict) else None
-        if isinstance(nested, dict):
-            value = _signed_numeric(nested, ("dayChange", "change", "change24h", "priceChange"))
-            if value is not None:
-                return value
-    return 0.0
+    return _first_numeric(data, ("dayDiff", "change", "changeValue")) or 0.0
 
 
 def _extract_day_percent(data):
     if not isinstance(data, dict):
         return 0.0
-    value = _signed_numeric(data, ("dayPercent", "changePercent", "changePct", "percentChange", "day_pct"))
-    if value is not None:
-        return value
-    for container in ("quote", "data", "tick", "result"):
-        nested = data.get(container) if isinstance(data, dict) else None
-        if isinstance(nested, dict):
-            value = _signed_numeric(nested, ("dayPercent", "changePercent", "changePct", "percentChange", "day_pct"))
-            if value is not None:
-                return value
-    return 0.0
+    value = _first_numeric(data, ("dayDiffPercent", "dayPct", "changePercent", "percent"))
+    return value if value is not None else 0.0
 
 
 def get_live_price():
-    """جلب السعر اللحظي الحقيقي فقط، دون استخدام OHLC كبديل."""
+    """Fetch the live XAUUSD quote only from Biquote's quote endpoint.
+
+    IMPORTANT: OHLC candles are never used as a fallback here. If the live
+    quote is unavailable or invalid, an exception is raised so the user sees
+    that the live price is unavailable instead of receiving an old candle.
+
+    This function is intentionally synchronous because price() runs it with
+    asyncio.to_thread(). This prevents the 'coroutine was never awaited'
+    RuntimeWarning that affected the previous v16 build.
+    """
+    url = f"https://biquote.io/api/{SYMBOL}"
     response = requests.get(
-        LIVE_PRICE_URL,
+        url,
         params={"allowStale": "false"},
-        timeout=10
+        timeout=10,
     )
     response.raise_for_status()
     data = response.json()
+
     price = _extract_live_price(data)
     if price is None or price <= 0:
         raise ValueError("مصدر السعر المباشر لم يُرجع سعرًا صالحًا")
+
+    day_diff = _extract_day_change(data)
+    day_pct = _extract_day_percent(data)
+
+    # If only the percentage is supplied, derive the displayed day change.
+    if day_diff == 0.0 and day_pct != 0.0:
+        day_diff = price * day_pct / 100.0
+
     return {
         "price": price,
-        "day_diff": _extract_day_change(data),
-        "day_pct": _extract_day_percent(data),
-        "source": "live"
+        "day_diff": day_diff,
+        "day_pct": day_pct,
+        "source": "Biquote Live Quote",
+        "raw": data,
     }
 
 
@@ -631,38 +622,66 @@ def analyze_frame(df, scalp=False):
 # =========================================================
 
 def calculate_support_resistance(df, lookback=80):
-    x = df.tail(min(lookback, len(df))).copy()
+    """Build S/R from confirmed swing pivots, clustered by ATR.
+
+    This avoids treating every candle high/low as an independent level, which
+    was the reason v15 could output very noisy levels such as 4610.38/4611.33.
+    """
+    x = df.tail(min(lookback, len(df))).copy().reset_index(drop=True)
     current = safe_float(x["close"].iloc[-1])
+    atr_v = max(safe_float(atr(x["high"], x["low"], x["close"], 14).iloc[-1]), 0.05)
+    radius = atr_v * S_R_CLUSTER_ATR
 
-    # Pivot-style candidates, then keep nearest distinct levels.
-    lows = sorted(set(round(float(v), 2) for v in x["low"]))
-    highs = sorted(set(round(float(v), 2) for v in x["high"]))
+    candidates_support, candidates_resistance = [], []
+    for i in range(2, len(x) - 2):
+        h = safe_float(x["high"].iloc[i])
+        l = safe_float(x["low"].iloc[i])
+        if h >= safe_float(x["high"].iloc[i-2:i+3].max()):
+            candidates_resistance.append(h)
+        if l <= safe_float(x["low"].iloc[i-2:i+3].min()):
+            candidates_support.append(l)
 
-    supports = sorted([v for v in lows if v < current], reverse=True)
-    resistances = sorted([v for v in highs if v > current])
+    def cluster(values):
+        values = sorted(values)
+        clusters = []
+        for value in values:
+            if not clusters or abs(value - clusters[-1][-1]) > radius:
+                clusters.append([value])
+            else:
+                clusters[-1].append(value)
+        # Weighted by number of touches; newest/nearby level gets preference later.
+        return [(sum(c)/len(c), len(c)) for c in clusters]
 
-    atr_v = safe_float(atr(
-        x["high"], x["low"], x["close"], 14
-    ).iloc[-1])
+    supports = [(v, touches) for v, touches in cluster(candidates_support) if v < current]
+    resistances = [(v, touches) for v, touches in cluster(candidates_resistance) if v > current]
 
-    if not supports:
-        supports = [current - atr_v]
-    if len(supports) < 3:
-        supports += [supports[-1] - atr_v * i for i in range(1, 4)]
+    supports.sort(key=lambda z: (abs(current-z[0]), -z[1]))
+    resistances.sort(key=lambda z: (abs(z[0]-current), -z[1]))
 
-    if not resistances:
-        resistances = [current + atr_v]
-    if len(resistances) < 3:
-        resistances += [resistances[-1] + atr_v * i for i in range(1, 4)]
+    def fill(items, side):
+        out = [v for v, _ in items]
+        step = max(atr_v * 0.85, 0.10)
+        if side == 'support':
+            base = out[-1] if out else current - step
+            while len(out) < 3:
+                base -= step
+                out.append(base)
+        else:
+            base = out[-1] if out else current + step
+            while len(out) < 3:
+                base += step
+                out.append(base)
+        return out[:3]
 
+    s = fill(supports, 'support')
+    r = fill(resistances, 'resistance')
     return {
         "current": current,
-        "support1": supports[0],
-        "support2": supports[1],
-        "support3": supports[2],
-        "resistance1": resistances[0],
-        "resistance2": resistances[1],
-        "resistance3": resistances[2]
+        "support1": s[0], "support2": s[1], "support3": s[2],
+        "resistance1": r[0], "resistance2": r[1], "resistance3": r[2],
+        "atr": atr_v,
+        "support_touches": supports[0][1] if supports else 0,
+        "resistance_touches": resistances[0][1] if resistances else 0
     }
 
 
@@ -683,39 +702,73 @@ def build_entry_zone(direction, current, levels, atr_value):
 
 
 def mtf_engine(m15, m5, m1):
-    # M15 = context, M5 = confirmation, M1 = trigger.
+    """MTF scalp engine.
+
+    M15 is the market context, M5 is confirmation/pullback state and M1 is
+    the entry trigger.  A short M5/M1 correction is not allowed to flip a
+    clear M15 trend into the opposite market direction.
+    """
     weighted = (
         m15["score"] * 0.45 +
         m5["score"] * 0.35 +
         m1["score"] * 0.20
     )
 
-    bullish = [x["direction"] == "BUY" for x in (m15, m5, m1)]
-    bearish = [x["direction"] == "SELL" for x in (m15, m5, m1)]
+    # Context comes from the M15 trend first, not from a single short-term
+    # indicator. This is the key protection against "bearish pullback" being
+    # misclassified as a bearish market.
+    if m15["trend"] == "🟢 صاعد":
+        context = "BUY"
+    elif m15["trend"] == "🔴 هابط":
+        context = "SELL"
+    else:
+        context = m15["direction"] if m15["direction"] in ("BUY", "SELL") else "WAIT"
 
-    context = m15["direction"]
-    trigger = m1["direction"]
+    m5_dir = m5["direction"]
+    m1_dir = m1["direction"]
 
-    if all(bullish):
+    # A counter-direction M5 reading is treated as a pullback when M15
+    # structure still agrees with the larger context.
+    bullish_pullback = (
+        context == "BUY"
+        and m5_dir == "SELL"
+        and m15["structure"] == "🟢 HH/HL"
+        and m5["structure"] != "🔴 LH/LL"
+    )
+    bearish_pullback = (
+        context == "SELL"
+        and m5_dir == "BUY"
+        and m15["structure"] == "🔴 LH/LL"
+        and m5["structure"] != "🟢 HH/HL"
+    )
+
+    if bullish_pullback:
+        phase = "🟢 Bullish Pullback"
+    elif bearish_pullback:
+        phase = "🔴 Bearish Pullback"
+    elif context == "BUY" and m5_dir == "BUY":
+        phase = "🟢 Bullish Confirmation"
+    elif context == "SELL" and m5_dir == "SELL":
+        phase = "🔴 Bearish Confirmation"
+    elif context in ("BUY", "SELL"):
+        phase = "🟡 تصحيح/تعارض قصير الأجل"
+    else:
+        phase = "🟡 سياق غير واضح"
+
+    # Entry direction requires the M1 trigger to return to the M15 context.
+    # This prevents entering while the correction is still running.
+    if context == "BUY" and m1_dir == "BUY":
         direction = "BUY"
-    elif all(bearish):
-        direction = "SELL"
-    elif context == "BUY" and trigger == "BUY" and m5["direction"] != "SELL":
-        direction = "BUY"
-    elif context == "SELL" and trigger == "SELL" and m5["direction"] != "BUY":
+    elif context == "SELL" and m1_dir == "SELL":
         direction = "SELL"
     else:
         direction = "WAIT"
 
-    conflict = conflict_analysis(
-        direction,
-        context,
-        m5["direction"]
-    )
+    conflict = conflict_analysis(direction, context, m5_dir)
 
     wick_ok = (
-        (direction == "BUY" and m15["wick_bias"] == "bullish_rejection") or
-        (direction == "SELL" and m15["wick_bias"] == "bearish_rejection")
+        (context == "BUY" and m15["wick_bias"] == "bullish_rejection") or
+        (context == "SELL" and m15["wick_bias"] == "bearish_rejection")
     )
 
     if direction == "BUY":
@@ -723,11 +776,15 @@ def mtf_engine(m15, m5, m1):
             weighted += 4
         if m5["structure"] == "🟢 HH/HL":
             weighted += 3
+        if bullish_pullback:
+            weighted += 5
     elif direction == "SELL":
         if m15["structure"] == "🔴 LH/LL":
             weighted += 4
         if m5["structure"] == "🔴 LH/LL":
             weighted += 3
+        if bearish_pullback:
+            weighted += 5
 
     if wick_ok:
         weighted += 3
@@ -750,6 +807,8 @@ def mtf_engine(m15, m5, m1):
 
     score = int(max(0, min(round(weighted), 100)))
 
+    # 73% is only a confluence threshold. An actual entry also needs context,
+    # a returned M1 trigger, acceptable risk and sufficient market quality.
     strict_conditions = (
         direction in ("BUY", "SELL")
         and score >= TRADE_THRESHOLD
@@ -759,29 +818,54 @@ def mtf_engine(m15, m5, m1):
         and m5["adx"] >= 15
         and m15["liquidity_ratio"] >= 0.80
         and m5["liquidity_ratio"] >= 0.80
+        and (m5_dir in (direction, "SELL" if direction == "BUY" else "BUY"))
+        and not (
+            (direction == "BUY" and m5_dir == "SELL" and m5["structure"] == "🔴 LH/LL")
+            or
+            (direction == "SELL" and m5_dir == "BUY" and m5["structure"] == "🟢 HH/HL")
+        )
     )
 
     perfect_conditions = (
         direction in ("BUY", "SELL")
         and score >= STRICT_100_THRESHOLD
         and risk == "🟢 منخفض"
-        and m15["direction"] == m5["direction"] == m1["direction"]
+        and context == direction
+        and m15["direction"] == m5["direction"] == m1["direction"] == direction
         and not any(x["extended"] for x in (m15, m5, m1))
         and m15["adx"] >= 25
         and m5["adx"] >= 20
         and m1["adx"] >= 15
         and m15["liquidity_ratio"] >= 1.0
         and m5["liquidity_ratio"] >= 1.0
+        and wick_ok
+    )
+
+    # Secret Scalp is intentionally stricter than the normal 73% gate.
+    secret_ready = (
+        strict_conditions
+        and score >= 85
+        and context == direction
+        and m1_dir == direction
+        and (m5_dir == direction or bullish_pullback or bearish_pullback)
+        and m15["structure"] in ("🟢 HH/HL", "🔴 LH/LL")
+        and m5["structure"] in ("🟢 HH/HL", "🔴 LH/LL")
+        and wick_ok
     )
 
     return {
         "direction": direction,
+        "context": context,
+        "phase": phase,
         "score": min(score, 100),
         "risk": risk,
         "conflict": conflict,
         "wick_ok": wick_ok,
+        "bullish_pullback": bullish_pullback,
+        "bearish_pullback": bearish_pullback,
         "strict_ready": strict_conditions,
-        "perfect": perfect_conditions
+        "secret_ready": secret_ready,
+        "perfect": perfect_conditions,
     }
 
 
@@ -909,10 +993,7 @@ async def weekly_job(context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 logger.exception("Weekly report error")
 
-    # Automatically disappear outside the weekly window.
-    if now.weekday() != 6 and WEEKLY_REPORT_WEEK == current_week_key():
-        WEEKLY_REPORT = None
-        WEEKLY_REPORT_WEEK = None
+    # Keep the latest report available until the next weekly report replaces it.
 
 
 # =========================================================
@@ -920,61 +1001,59 @@ async def weekly_job(context: ContextTypes.DEFAULT_TYPE):
 # =========================================================
 
 async def command_lock(update, command):
+    """Allow the command and remove ALL previous results for that command."""
     chat_id = update.effective_chat.id
     key = (chat_id, command)
     now = time.time()
     previous = COMMAND_LOCKS.get(key, 0)
 
-    # Prevent accidental double-taps only for a very short window.
-    if now - previous < 3:
+    if now - previous < 1.5:
         return False
 
     COMMAND_LOCKS[key] = now
+
+    old_message_ids = COMMAND_MESSAGES.get(key, [])
+    if APPLICATION is not None:
+        for message_id in list(old_message_ids):
+            try:
+                await APPLICATION.bot.delete_message(
+                    chat_id=chat_id,
+                    message_id=message_id
+                )
+            except Exception as exc:
+                logger.debug(
+                    "Old command message could not be deleted (%s): %s",
+                    message_id, exc
+                )
+
+    COMMAND_MESSAGES[key] = []
     return True
 
 
-async def replace_command_reply(update: Update, command: str, text: str):
-    """Send the newest result for a command and remove that command's old result.
-
-    Each command has its own slot per chat. A new result therefore replaces the
-    previous result of the SAME command instead of stacking messages. Results
-    from different commands remain independent.
-    """
+async def command_reply(update, command, text):
+    """Send a command result and remember it for complete replacement."""
     chat_id = update.effective_chat.id
-    key = (chat_id, command)
-    old_message_id = COMMAND_MESSAGES.get(key)
-
-    if old_message_id:
-        try:
-            await context_bot_delete(update, old_message_id)
-        except Exception:
-            # The old message may already be deleted or outside Telegram's
-            # deletion window; never block the new result because of that.
-            logger.debug("Could not delete old command message: %s", key, exc_info=True)
-
-    sent = await update.message.reply_text(text)
-    COMMAND_MESSAGES[key] = sent.message_id
-    return sent
-
-
-async def context_bot_delete(update: Update, message_id: int):
-    await update.get_bot().delete_message(
-        chat_id=update.effective_chat.id,
-        message_id=message_id
-    )
+    msg = await update.message.reply_text(text)
+    COMMAND_MESSAGES[(chat_id, command)] = [msg.message_id]
+    return msg
 
 
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    subscribed = update.effective_chat.id in SUBSCRIBERS
+    auto_button = (
+        "🟢 الصفقة التلقائية: تشغيل"
+        if subscribed else
+        "🔴 الصفقة التلقائية: إيقاف"
+    )
+    state = "🟢 مفعّلة" if subscribed else "🔴 متوقفة"
     keyboard = [
         ["📊 التحليل اليومي", "⚡ التحليل السريع"],
-        ["🕵️ Secret Scalp", "🎯 صفقة الآن"],
-        ["📍 الدعوم والمقاومات", "💰 سعر الذهب"],
-        ["🔔 تفعيل الصفقات التلقائية", "🔕 إيقاف الصفقات التلقائية"],
+        ["📅 التحليل الأسبوعي", "🕵️ Secret Scalp"],
+        ["🎯 صفقة الآن", "💰 سعر الذهب"],
+        [auto_button],
         ["🌍 الأسواق", "🟢 حالة النظام"],
         ["🆘 الدعم"],
     ]
-    subscribed = update.effective_chat.id in SUBSCRIBERS
-    state = "🟢 مفعّلة" if subscribed else "🔕 متوقفة"
     text = (
         "🤖 XAU SMART TRADER\n"
         "🥇 محرك XAUUSD متعدد العوامل\n\n"
@@ -1000,10 +1079,13 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     routes = {
         "📊 التحليل اليومي": daily,
         "⚡ التحليل السريع": quick,
+        "📅 التحليل الأسبوعي": weekly,
         "🕵️ Secret Scalp": scalp,
         "🎯 صفقة الآن": trade,
         "📍 الدعوم والمقاومات": levels,
         "💰 سعر الذهب": price,
+        "🟢 الصفقة التلقائية: تشغيل": toggle_auto,
+        "🔴 الصفقة التلقائية: إيقاف": toggle_auto,
         "🔔 تفعيل الصفقات التلقائية": subscribe,
         "🔕 إيقاف الصفقات التلقائية": unsubscribe,
         "🌍 الأسواق": markets,
@@ -1018,16 +1100,16 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await command_lock(update, "status"):
-        return
     subscribed = update.effective_chat.id in SUBSCRIBERS
-    await replace_command_reply(update, "status", 
+    await update.message.reply_text(
         "🤖 XAU SMART TRADER v16.0\n\n"
         "🟢 النظام: يعمل\n"
         "🌐 Webhook: يعمل\n"
         "📡 البيانات: متاحة\n"
         "🧠 Multi-Factor: ON\n"
         "🕵️ Secret Scalp M15/M5/M1: مفعّل\n"
+        "🧱 S/R Cluster: مفعّل\n"
+        "🏦 Institutional Layer: إطار مفعّل بدون بيانات مخترعة\n"
         f"🎯 عتبة التأهيل: {TRADE_THRESHOLD}%\n"
         f"💯 الوضع الصارم 100%: مفعّل\n"
         "💧 السيولة: مفعّلة\n"
@@ -1045,24 +1127,32 @@ async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await command_lock(update, "price"):
         return
     try:
-        live = await asyncio.to_thread(get_live_price)
-        current = live["price"]
-        change = live["day_diff"]
-        pct = live["day_pct"]
-        await replace_command_reply(update, "price",
-            f"🥇 XAUUSD\n\n"
-            f"💰 السعر اللحظي: {current:.2f}\n"
+        # get_live_price is synchronous; run it outside the Telegram event loop.
+        quote = await asyncio.to_thread(get_live_price)
+        current = quote["price"]
+        change = quote["day_diff"]
+        pct = quote["day_pct"]
+
+        raw = quote.get("raw", {})
+        market_state = raw.get("marketState", raw.get("status", "غير معروف")) if isinstance(raw, dict) else "غير معروف"
+        quote_age = raw.get("quoteAgeSeconds", "غير متاح") if isinstance(raw, dict) else "غير متاح"
+
+        text = (
+            "🥇 XAUUSD — السعر اللحظي\n\n"
+            f"💰 السعر: {current:.2f}\n"
             f"📊 التغير اليومي: {change:+.2f} ({pct:+.2f}%)\n"
-            f"📡 المصدر: السعر المباشر\n"
+            f"📡 حالة السوق: {market_state}\n"
+            f"⚡ عمر السعر: {quote_age} ثانية\n"
+            "🛰️ المصدر: Biquote Live Quote\n"
             f"🕐 دمشق: {datetime.now(DAMASCUS).strftime('%Y-%m-%d %I:%M:%S %p')}"
         )
+        await command_reply(update, "price", text)
     except Exception as e:
         await safe_reply(
             update,
-            "❌ تعذر الحصول على السعر اللحظي.\n\n"
+            "❌ تعذر الحصول على السعر اللحظي.\n"
             "لم يتم استخدام OHLC كبديل حتى لا يظهر سعر قديم على أنه لحظي.\n"
-            f"السبب: {e}",
-            "price"
+            f"السبب: {e}"
         )
 
 
@@ -1072,19 +1162,20 @@ async def levels(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         d1 = get_bars("1d", 150)
         x = calculate_support_resistance(d1, 80)
-        await replace_command_reply(update, "levels", 
+        await command_reply(update, "levels",
             "📍 XAUUSD — مستويات رئيسية\n\n"
             f"💰 السعر: {x['current']:.2f}\n\n"
-            f"🟢 S1: {x['support1']:.2f}\n"
-            f"🟢 S2: {x['support2']:.2f}\n"
+            f"🟢 دعم 1: {x['support1']:.2f}\n"
+            f"🟢 دعم 2: {x['support2']:.2f}\n"
             f"🟢 S3: {x['support3']:.2f}\n\n"
-            f"🔴 R1: {x['resistance1']:.2f}\n"
-            f"🔴 R2: {x['resistance2']:.2f}\n"
+            f"🔴 مقاومة 1: {x['resistance1']:.2f}\n"
+            f"🔴 مقاومة 2: {x['resistance2']:.2f}\n"
             f"🔴 R3: {x['resistance3']:.2f}\n\n"
-            "⚠️ المستويات تحتاج تأكيدًا سعريًا وحجميًا قبل التنفيذ."
+            f"🎯 دقة المنطقة: S1 لمس {x.get('support_touches', 0)} / R1 لمس {x.get('resistance_touches', 0)}\n"
+            "⚠️ المستويات مناطق وليست أرقامًا سحرية؛ التأكيد السعري والحجمي مطلوب قبل التنفيذ."
         )
     except Exception as e:
-        await safe_reply(update, f"❌ تعذر حساب المستويات: {e}", "levels")
+        await safe_reply(update, f"❌ تعذر حساب المستويات: {e}")
 
 
 async def weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1092,11 +1183,13 @@ async def weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     global WEEKLY_REPORT
     if WEEKLY_REPORT:
-        await replace_command_reply(update, "weekly", WEEKLY_REPORT)
+        await command_reply(update, "weekly", WEEKLY_REPORT)
     else:
-        await replace_command_reply(update, "weekly", 
-            "📅 التقرير الأسبوعي التلقائي يُثبت كل أحد الساعة 7:00 مساءً بتوقيت دمشق "
-            "ويُزال تلقائيًا بعد نهاية نافذة الأسبوع."
+        await command_reply(
+            update, "weekly",
+            "📅 التقرير الأسبوعي\n\n"
+            "سيُنشأ تلقائيًا كل أحد الساعة 7:00 مساءً بتوقيت دمشق.\n"
+            "ويبقى متاحًا خلال الأسبوع بدل اختفائه يوم الاثنين."
         )
 
 
@@ -1114,7 +1207,7 @@ async def daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bias = "🟢 صاعد" if score >= 50 and dr["direction"] == "BUY" else \
                "🔴 هابط" if score >= 50 and dr["direction"] == "SELL" else "🟡 مختلط"
 
-        await replace_command_reply(update, "daily", 
+        await command_reply(update, "daily",
             "📊 تحليل الذهب\n"
             f"ليوم {datetime.now(DAMASCUS).strftime('%Y-%m-%d')} "
             f"بتوقيت دمشق {datetime.now(DAMASCUS).strftime('%I:%M %p')}\n\n"
@@ -1142,7 +1235,7 @@ async def daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "المتغير الأساسي: كسر أقرب دعم أو مقاومة."
         )
     except Exception as e:
-        await safe_reply(update, f"❌ تعذر تنفيذ التحليل اليومي: {e}", "daily")
+        await safe_reply(update, f"❌ تعذر تنفيذ التحليل اليومي: {e}")
 
 
 async def quick(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1150,17 +1243,32 @@ async def quick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         m15_df = get_bars("15m", 300)
-        m15 = analyze_frame(m15_df, scalp=True)
-        levels = calculate_support_resistance(m15_df, 80)
-        await replace_command_reply(update, "quick", 
-            "⚡ التحليل السريع — XAUUSD\n\n"
-            f"1. الاتجاه الحالي: {m15['trend']}\n"
-            f"2. منطقة الاهتمام: دعم {levels['support1']:.2f} / مقاومة {levels['resistance1']:.2f}\n"
-            f"3. نسبة التوافق: {m15['score']}%\n\n"
-            f"القرار الأولي: {'🟢 صاعد' if m15['direction']=='BUY' else '🔴 هابط' if m15['direction']=='SELL' else '🟡 انتظار'}"
+        m5_df = get_bars("5m", 300)
+        m1_df = get_bars("1m", 300)
+        m15, m5, m1 = [analyze_frame(x, scalp=True) for x in (m15_df, m5_df, m1_df)]
+        engine = mtf_engine(m15, m5, m1)
+        levels = calculate_support_resistance(m5_df, 80)
+        result = (
+            "⚡ XAU SMART TRADER v16.0 — التحليل السريع\n\n"
+            "📖 قراءة أولية\n"
+            f"الاتجاه الحالي: {m15['trend']}\n"
+            f"منطقة الاهتمام: دعم {levels['support1']:.2f} / مقاومة {levels['resistance1']:.2f}\n"
+            f"نسبة التوافق: {engine['score']}%\n\n"
+            "🕵️ المحرك متعدد الفريمات\n"
+            f"سياق M15: {m15['direction']} — {m15['score']}%\n"
+            f"تأكيد M5: {m5['direction']} — {m5['score']}%\n"
+            f"إشارة M1: {m1['direction']} — {m1['score']}%\n\n"
+            f"🎯 النتيجة: {'🟢 شراء' if engine['direction']=='BUY' else '🔴 بيع' if engine['direction']=='SELL' else '⏳ انتظار'}\n"
+            f"💪 التوافق: {engine['score']}%\n"
+            f"🛡️ الخطر: {engine['risk']}\n"
+            f"🧠 التعارضات: {engine['conflict']}\n"
+            f"🕯️ ذيل M15: {'🟢 مؤكد' if engine['wick_ok'] else '🟡 غير مؤكد'}\n\n"
+            f"{'🎯 شروط 73% مكتملة' if engine['strict_ready'] else '⏳ لم تكتمل شروط 73%'}\n"
+            f"{'💯 إشارة 100% صارمة' if engine['perfect'] else '🔒 لا توجد حالة 100% الآن'}"
         )
+        await command_reply(update, "quick", result)
     except Exception as e:
-        await safe_reply(update, f"❌ تعذر تنفيذ التحليل السريع: {e}", "quick")
+        await safe_reply(update, f"❌ تعذر تنفيذ التحليل السريع: {e}")
 
 
 async def scalp(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1177,8 +1285,8 @@ async def scalp(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         levels = calculate_support_resistance(m5_df, 80)
 
-        await replace_command_reply(update, "scalp", 
-            "⚡ XAU SMART TRADER v16.0 — التحليل السريع\n\n"
+        await command_reply(update, "scalp",
+            "🕵️ XAU SMART TRADER — Secret Scalp\n\n"
             "📖 قراءة أولية\n"
             f"الاتجاه الحالي: {m15['trend']}\n"
             f"منطقة الاهتمام: دعم {levels['support1']:.2f} / مقاومة {levels['resistance1']:.2f}\n"
@@ -1187,16 +1295,19 @@ async def scalp(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"سياق M15: {m15['direction']} — {m15['score']}%\n"
             f"تأكيد M5: {m5['direction']} — {m5['score']}%\n"
             f"إشارة M1: {m1['direction']} — {m1['score']}%\n\n"
-            f"🎯 النتيجة: {'🟢 شراء' if engine['direction']=='BUY' else '🔴 بيع' if engine['direction']=='SELL' else '🟡 انتظار'}\n"
+            f"🧭 السياق الأكبر M15: {'🟢 صاعد' if engine['context']=='BUY' else '🔴 هابط' if engine['context']=='SELL' else '🟡 غير واضح'}\n"
+            f"🔄 حالة M5: {engine['phase']}\n"
+            f"🎯 Trigger M1: {'🟢 شراء' if engine['direction']=='BUY' else '🔴 بيع' if engine['direction']=='SELL' else '⏳ لم يتأكد'}\n"
             f"💪 التوافق: {engine['score']}%\n"
             f"🛡️ الخطر: {engine['risk']}\n"
             f"🧠 التعارضات: {engine['conflict']}\n"
             f"🕯️ ذيل M15: {'🟢 مؤكد' if engine['wick_ok'] else '🟡 غير مؤكد'}\n\n"
             f"{'🎯 شروط 73% مكتملة' if engine['strict_ready'] else '⏳ لم تكتمل شروط 73%'}\n"
+            f"{'🕵️ Secret Scalp 85%+ جاهز' if engine['secret_ready'] else '🔒 Secret Scalp غير مكتمل'}\n"
             f"{'💯 إشارة 100% صارمة' if engine['perfect'] else '🔒 لا توجد حالة 100% الآن'}"
         )
     except Exception as e:
-        await safe_reply(update, f"❌ تعذر تنفيذ التحليل السريع: {e}", "quick")
+        await safe_reply(update, f"❌ تعذر تنفيذ التحليل السريع: {e}")
 
 
 async def trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1212,7 +1323,7 @@ async def trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
         engine = mtf_engine(m15, m5, m1)
 
         if not engine["strict_ready"]:
-            await replace_command_reply(update, "trade", 
+            await command_reply(update, "trade",
                 "⏳ لا توجد صفقة عالية الدقة الآن.\n\n"
                 f"التوافق: {engine['score']}%\n"
                 f"الخطر: {engine['risk']}\n"
@@ -1224,7 +1335,7 @@ async def trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
         entry, sl, tp1, tp2, levels = build_trade(engine["direction"], m5_df)
         label = "💯 إشارة صارمة 100%" if engine["perfect"] else "🎯 دقة عالية 73%+"
 
-        await replace_command_reply(update, "trade", 
+        await command_reply(update, "trade",
             "🤖 XAU SMART TRADER v16.0\n\n"
             f"{label}\n\n"
             f"📈 الاتجاه: {'🟢 شراء' if engine['direction']=='BUY' else '🔴 بيع'}\n"
@@ -1235,12 +1346,12 @@ async def trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🛑 وقف الخسارة: {sl:.2f}\n"
             f"🎯 الهدف الأول: {tp1:.2f}\n"
             f"🎯 الهدف الثاني: {tp2:.2f}\n\n"
-            f"🧱 S1: {levels['support1']:.2f}\n"
+            f"🧱 دعم 1: {levels['support1']:.2f}\n"
             f"🔴 R1: {levels['resistance1']:.2f}\n\n"
             "⚠️ الإشارة تحليلية وليست ضمانًا للربح."
         )
     except Exception as e:
-        await safe_reply(update, f"❌ تعذر تشغيل محرك الصفقة: {e}", "trade")
+        await safe_reply(update, f"❌ تعذر تشغيل محرك الصفقة: {e}")
 
 
 # =========================================================
@@ -1261,11 +1372,14 @@ def get_auto_signal():
                     for x in (m15_df, m5_df, m1_df)]
     engine = mtf_engine(m15, m5, m1)
 
-    if not engine["strict_ready"]:
+    if not engine["secret_ready"]:
         return None
 
     direction = engine["direction"]
     entry, sl, tp1, tp2, levels = build_trade(direction, m5_df)
+    candle_key = None
+    if "openTime" in m5_df.columns and len(m5_df):
+        candle_key = str(m5_df["openTime"].iloc[-1])
 
     return {
         "direction": direction,
@@ -1275,7 +1389,8 @@ def get_auto_signal():
         "sl": sl,
         "tp1": tp1,
         "tp2": tp2,
-        "perfect": engine["perfect"]
+        "perfect": engine["perfect"],
+        "candle_key": candle_key
     }
 
 
@@ -1289,7 +1404,10 @@ async def auto_trade_loop():
                     now = time.time()
                     signature = (
                         signal["direction"],
-                        round(signal["entry"], 1),
+                        round(signal["entry"], 2),
+                        round(signal["sl"], 2),
+                        round(signal["tp1"], 2),
+                        signal.get("candle_key"),
                         signal["perfect"]
                     )
 
@@ -1303,7 +1421,7 @@ async def auto_trade_loop():
 
                         text = (
                             "🚨 XAU SMART TRADER v16.0\n\n"
-                            f"{'💯 إشارة صارمة 100%' if signal['perfect'] else '🎯 دقة عالية 73%+'}\n\n"
+                            f"{'💯 إشارة صارمة 100%' if signal['perfect'] else '🕵️ Secret Scalp 85%+'}\n\n"
                             f"📈 الاتجاه: {'🟢 شراء' if signal['direction']=='BUY' else '🔴 بيع'}\n"
                             f"💪 التوافق: {signal['confidence']}%\n"
                             f"🛡️ الخطر: {signal['risk']}\n\n"
@@ -1329,20 +1447,43 @@ async def auto_trade_loop():
         await asyncio.sleep(AUTO_CHECK_SECONDS)
 
 
+async def toggle_auto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+
+    if chat_id in SUBSCRIBERS:
+        SUBSCRIBERS.discard(chat_id)
+        LAST_AUTO_SIGNAL.pop(chat_id, None)
+        LAST_AUTO_TIME.pop(chat_id, None)
+        state = "🔴 إيقاف"
+        message = "🔴 تم إيقاف الصفقات التلقائية."
+    else:
+        SUBSCRIBERS.add(chat_id)
+        state = "🟢 تشغيل"
+        message = (
+            "🟢 تم تشغيل الصفقات التلقائية.\n"
+            "لن تتراكم الإشارات المكررة، وتعمل داخل نافذة اليوم فقط."
+        )
+
+    await update.message.reply_text(message)
+    await show_main_menu(update, context)
+
+
 async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Compatibility for /subscribe.
     SUBSCRIBERS.add(update.effective_chat.id)
-    await update.message.reply_text(
-        "🟢 تم تفعيل الصفقات التلقائية.\n"
-        "لن تتراكم الإشارات المكررة، وتعمل داخل نافذة اليوم فقط.\n"
-        "🔕 /unsubscribe للإيقاف."
-    )
+    LAST_AUTO_SIGNAL.pop(update.effective_chat.id, None)
+    LAST_AUTO_TIME.pop(update.effective_chat.id, None)
+    await update.message.reply_text("🟢 تم تشغيل الصفقات التلقائية.")
+    await show_main_menu(update, context)
 
 
 async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Compatibility for /unsubscribe.
     SUBSCRIBERS.discard(update.effective_chat.id)
     LAST_AUTO_SIGNAL.pop(update.effective_chat.id, None)
     LAST_AUTO_TIME.pop(update.effective_chat.id, None)
-    await update.message.reply_text("🔕 تم إيقاف الصفقات التلقائية.")
+    await update.message.reply_text("🔴 تم إيقاف الصفقات التلقائية.")
+    await show_main_menu(update, context)
 
 
 # =========================================================
@@ -1350,10 +1491,8 @@ async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================================================
 
 async def markets(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await command_lock(update, "markets"):
-        return
     now = datetime.now(DAMASCUS)
-    await replace_command_reply(update, "markets", 
+    await update.message.reply_text(
         "🌍 مواعيد الأسواق — توقيت دمشق\n\n"
         "🌏 سيدني: 12:00 ص\n"
         "🇯🇵 طوكيو: 3:00 ص\n"
@@ -1367,9 +1506,7 @@ async def markets(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def support(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await command_lock(update, "support"):
-        return
-    await replace_command_reply(update, "support", 
+    await update.message.reply_text(
         "🆘 الدعم\n\n"
         "للتواصل مع الدعم:\n"
         "@Morhafsy"
@@ -1380,13 +1517,10 @@ async def support(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # SAFE REPLY
 # =========================================================
 
-async def safe_reply(update, text, command=None):
+async def safe_reply(update, text):
     try:
         if update and update.message:
-            if command:
-                await replace_command_reply(update, command, text)
-            else:
-                await update.message.reply_text(text)
+            await update.message.reply_text(text)
     except Exception:
         logger.exception("Reply error")
 
@@ -1486,11 +1620,8 @@ async def scheduler_loop():
                     except Exception:
                         logger.exception("Weekly scheduler error")
 
-            # Weekly report is removed automatically after Sunday.
-            if now.weekday() != 6:
-                global WEEKLY_REPORT, WEEKLY_REPORT_WEEK
-                WEEKLY_REPORT = None
-                WEEKLY_REPORT_WEEK = None
+            # Keep the latest weekly report available all week. It is replaced
+            # by the new report next Sunday at 19:00 Damascus.
 
             # 15-minute pre-New-York alert. المطلوب في الإصدار 16:00 Damascus.
             alert_at = (datetime.combine(
@@ -1507,7 +1638,7 @@ async def scheduler_loop():
                     try:
                         await APPLICATION.bot.send_message(
                             chat_id=chat_id,
-                            text="🔔 تنبيه: تبقى 15 دقيقة على افتتاح نيويورك حسب توقيت v16.0 (4:00 م دمشق)."
+                            text="🔔 تنبيه: تبقى 15 دقيقة على افتتاح نيويورك حسب توقيت v14.1 (4:00 م دمشق)."
                         )
                     except Exception:
                         logger.exception("Market alert error")
