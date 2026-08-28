@@ -985,10 +985,8 @@ def analyze(df):
 
 def multi_timeframe():
 
-    w1 = analyze(
-        get_bars("1w", 250)
-    )
-
+    d1 = analyze(
+d1 = build_week_frame(get_bars("1d", 500))
     d1 = analyze(
         get_bars("1d", 300)
     )
