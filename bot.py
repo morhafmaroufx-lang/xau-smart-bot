@@ -165,6 +165,8 @@ def fmt(value):
 # ============================================================
 def cache_key(interval, limit):
     return f"{SYMBOL}_{interval}_{limit}"
+
+
 def get_bars(interval, limit=300):
     """
     جلب بيانات الذهب من Biquote.
