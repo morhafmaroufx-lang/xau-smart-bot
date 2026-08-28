@@ -53,7 +53,7 @@ NEW_YORK = ZoneInfo("America/New_York")
 
 CACHE_SECONDS = 20
 AUTO_SCAN_SECONDS = 60
-
+MIN_BARS = 30
 # ------------------------------------------------------------
 # أهم تعديل:
 # النظام ليس صارماً جداً.
