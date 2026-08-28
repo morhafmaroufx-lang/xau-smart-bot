@@ -164,27 +164,171 @@ def fmt(value):
 # البيانات
 # ============================================================
 
-def get_bars(interval, limit=300):
-    key = f"{interval}_{limit}"
+
+    def get_bars(interval, limit=300):
+    """
+    جلب بيانات الذهب من Biquote.
+    
+    Biquote لا يدعم الفريم الأسبوعي 1w مباشرة،
+    لذلك يتم بناء W1 من شموع D1 محلياً.
+    """
+
+    # =====================================================
+    # معالجة الفريم الأسبوعي
+    # =====================================================
+    if interval == "1w":
+        cache_key_name = f"1w_{limit}"
+        now = time.time()
+
+        cached = DATA_CACHE.get(cache_key_name)
+        if cached and now - cached[0] < CACHE_SECONDS:
+            return cached[1].copy()
+
+        # نحتاج بيانات يومية كافية لبناء الأسابيع
+        daily_limit = min(max(limit * 7 + 30, 100), 1000)
+
+        daily_df = get_bars("1d", daily_limit)
+
+        if daily_df is None or daily_df.empty:
+            raise ValueError("لا توجد بيانات يومية لبناء البيانات الأسبوعية")
+
+        df = daily_df.copy()
+
+        # التأكد من وجود الوقت
+        if "openTime" in df.columns:
+            df["openTime"] = pd.to_datetime(
+                df["openTime"],
+                utc=True,
+                errors="coerce"
+            )
+            df = df.dropna(subset=["openTime"])
+            df = df.set_index("openTime")
+
+        elif not isinstance(df.index, pd.DatetimeIndex):
+            raise ValueError("بيانات D1 لا تحتوي على وقت صالح")
+
+        # ترتيب زمني صحيح
+        df = df.sort_index()
+
+        # التأكد من الأعمدة المطلوبة
+        required = ["open", "high", "low", "close"]
+
+        for col in required:
+            if col not in df.columns:
+                raise ValueError(
+                    f"بيانات D1 ناقصة لبناء W1: {col}"
+                )
+
+            df[col] = pd.to_numeric(
+                df[col],
+                errors="coerce"
+            )
+
+        # tickVolume اختياري
+        if "tickVolume" in df.columns:
+            df["tickVolume"] = pd.to_numeric(
+                df["tickVolume"],
+                errors="coerce"
+            ).fillna(0)
+
+        # =================================================
+        # بناء الشموع الأسبوعية
+        # =================================================
+        weekly = pd.DataFrame()
+
+        weekly["open"] = df["open"].resample("W-SUN").first()
+        weekly["high"] = df["high"].resample("W-SUN").max()
+        weekly["low"] = df["low"].resample("W-SUN").min()
+        weekly["close"] = df["close"].resample("W-SUN").last()
+
+        if "tickVolume" in df.columns:
+            weekly["tickVolume"] = (
+                df["tickVolume"].resample("W-SUN").sum()
+            )
+        else:
+            weekly["tickVolume"] = 0
+
+        weekly = weekly.dropna(
+            subset=["open", "high", "low", "close"]
+        )
+
+        # نحتفظ بعدد الأسابيع المطلوبة
+        weekly = weekly.tail(limit)
+
+        if len(weekly) < MIN_BARS:
+            raise ValueError(
+                f"البيانات الأسبوعية غير كافية: "
+                f"{len(weekly)} شمعة فقط"
+            )
+
+        # إعادة openTime كعمود
+        weekly = weekly.reset_index()
+
+        # توحيد اسم الوقت
+        if "openTime" not in weekly.columns:
+            weekly.rename(
+                columns={weekly.columns[0]: "openTime"},
+                inplace=True
+            )
+
+        DATA_CACHE[cache_key_name] = (
+            now,
+            weekly.copy()
+        )
+
+        return weekly.copy()
+
+    # =====================================================
+    # الفريمات المدعومة مباشرة من Biquote
+    # =====================================================
+    supported_intervals = {
+        "1m",
+        "5m",
+        "15m",
+        "30m",
+        "1h",
+        "4h",
+        "1d"
+    }
+
+    if interval not in supported_intervals:
+        raise ValueError(
+            f"الفريم {interval} غير مدعوم من مصدر البيانات"
+        )
+
+    key = cache_key(interval, limit)
     now = time.time()
 
     cached = DATA_CACHE.get(key)
 
-    if cached and now - cached["time"] < CACHE_SECONDS:
-        return cached["df"].copy()
+    if cached and now - cached[0] < CACHE_SECONDS:
+        return cached[1].copy()
 
-    url = f"{DATA_URL}?interval={interval}&limit={limit}"
+    try:
+        response = requests.get(
+            DATA_URL,
+            params={
+                "interval": interval,
+                "limit": min(limit, 1000)
+            },
+            timeout=15
+        )
 
-    r = requests.get(url, timeout=15)
-    r.raise_for_status()
+        response.raise_for_status()
 
-    data = r.json()
+        data = response.json()
+
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            f"تعذر الاتصال بمصدر بيانات الذهب "
+            f"للفريم {interval}: {exc}"
+        ) from exc
 
     bars = data.get("bars", [])
 
     if not bars:
         raise ValueError(
-            f"لم تصل بيانات للفريم {interval}"
+            f"لا توجد بيانات للفريم {interval}"
         )
 
     df = pd.DataFrame(bars)
@@ -193,14 +337,13 @@ def get_bars(interval, limit=300):
         "open",
         "high",
         "low",
-        "close",
-        "tickVolume"
+        "close"
     ]
 
     for col in required:
         if col not in df.columns:
             raise ValueError(
-                f"حقل البيانات مفقود: {col}"
+                f"البيانات ناقصة: {col}"
             )
 
         df[col] = pd.to_numeric(
@@ -208,34 +351,56 @@ def get_bars(interval, limit=300):
             errors="coerce"
         )
 
+    # حجم التداول الحقيقي غير متوفر عادةً للذهب CFD،
+    # لذلك نعتمد على Tick Volume.
+    if "tickVolume" in df.columns:
+        df["tickVolume"] = pd.to_numeric(
+            df["tickVolume"],
+            errors="coerce"
+        ).fillna(0)
+    else:
+        df["tickVolume"] = 0
+
+    # الوقت
     if "openTime" in df.columns:
         df["openTime"] = pd.to_datetime(
             df["openTime"],
-            errors="coerce",
-            utc=True
+            utc=True,
+            errors="coerce"
         )
 
-    df = df.dropna(subset=required)
+        df = df.dropna(
+            subset=["openTime"]
+        )
 
+    # تنظيف
+    df = df.dropna(
+        subset=[
+            "open",
+            "high",
+            "low",
+            "close"
+        ]
+    )
+
+    # ترتيب زمني
     if "openTime" in df.columns:
-        df = (
-            df.dropna(subset=["openTime"])
-            .sort_values("openTime")
+        df = df.sort_values(
+            "openTime"
         )
 
-    df = df.reset_index(drop=True)
-
-    if len(df) < 50:
+    if len(df) < MIN_BARS:
         raise ValueError(
-            f"بيانات {interval} غير كافية"
+            f"البيانات غير كافية للفريم {interval}: "
+            f"{len(df)} شمعة"
         )
 
-    DATA_CACHE[key] = {
-        "time": now,
-        "df": df.copy()
-    }
+    DATA_CACHE[key] = (
+        now,
+        df.copy()
+    )
 
-    return df
+    return df.copy()
 
 
 # ============================================================
