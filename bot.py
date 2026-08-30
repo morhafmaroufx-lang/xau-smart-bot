@@ -1,5 +1,5 @@
 # ============================================================
-# XAU SMART TRADER v17.2
+# XAU SMART TRADER v18.0
 # Structural Liquidity + Quantitative Momentum
 # واجهة عربية بالكامل - توقيت دمشق
 #
@@ -963,22 +963,8 @@ def build_explanatory_report(timeframe="daily"):
         vals = [fmt(x) for x in targets if x is not None]
         return " ثم ".join(vals) if vals else "غير محددة من المستويات الحالية"
 
+    # تعريف صريح لتجنب NameError في بيئات Python/Render المختلفة.
     price_text = fmt(a["price"])
-
-    # تفسير مباشر للدرجة: ما الذي يرفعها وما الذي يضغط عليها.
-    all_factors = a["buy_factors"] if a["direction"] == "BUY" else a["sell_factors"]
-    strongest = all_factors[:5]
-    missing = []
-    if a["direction"] == "BUY":
-        if mtf["h4"]["direction"] != "BUY": missing.append("اتجاه H4 غير داعم للشراء")
-        if mtf["h1"]["direction"] != "BUY": missing.append("اتجاه H1 غير داعم للشراء")
-        if mtf["h4"]["structure"] != "صاعد": missing.append("هيكل H4 صاعد")
-        if mtf["m15"]["volume_ratio"] < 1.10: missing.append("حجم M15 داعم")
-    elif a["direction"] == "SELL":
-        if mtf["h4"]["direction"] != "SELL": missing.append("اتجاه H4 غير داعم للبيع")
-        if mtf["h1"]["direction"] != "SELL": missing.append("اتجاه H1 غير داعم للبيع")
-        if mtf["h4"]["structure"] != "هابط": missing.append("هيكل H4 هابط")
-        if mtf["m15"]["volume_ratio"] < 1.10: missing.append("حجم M15 داعم")
 
     lines = [
         f"📝 التقرير التوضيحي {label} — XAU/USD",
@@ -1000,13 +986,6 @@ def build_explanatory_report(timeframe="daily"):
     if primary["factors"]:
         lines.append("• أسباب الترجيح:")
         lines.extend("  - " + x for x in primary["factors"][:6])
-
-    lines.append("🧠 لماذا هذه الدرجة؟")
-    lines.append("• الأدلة الأقوى: " + ("، ".join(strongest) if strongest else "لا توجد أدلة قوية كافية حالياً"))
-    if missing:
-        lines.append("• ما ينقص السيناريو: " + "، ".join(missing[:5]))
-    else:
-        lines.append("• لا توجد فجوات رئيسية في الأدلة الحالية.")
 
     lines += [
         "",
@@ -1045,12 +1024,11 @@ def build_explanatory_report(timeframe="daily"):
 
 
 def build_weekly_report():
-    """التقرير الأسبوعي الموحد في v18.0."""
+    """إصلاح التقرير الأسبوعي: لا يعتمد على دوال غير موجودة في v17.1."""
     return build_explanatory_report("weekly")
 
 
 def build_daily_report():
-    """التقرير اليومي الموحد في v18.0."""
     return build_explanatory_report("daily")
 
 # ============================================================
@@ -1069,6 +1047,7 @@ async def start(update, context):
         ["📊 التحليل الكامل", "⚡ التحليل السريع"],
         ["🎯 صفقة الآن", "📍 الدعوم والمقاومات"],
         ["📝 التقرير التوضيحي اليومي", "📅 التقرير التوضيحي الأسبوعي"],
+        ["📅 التحليل الأسبوعي", "📝 التوضيحي اليومي"],
         ["📰 الأخبار", "💰 سعر الذهب"],
         ["🌍 الأسواق", "🔔 التنبيهات"],
         ["🟢 حالة النظام"]
@@ -1256,8 +1235,10 @@ async def router(update, context):
         "⚡ التحليل السريع": quick_analysis,
         "🎯 صفقة الآن": trade_now,
         "📍 الدعوم والمقاومات": show_levels,
+        "📅 التحليل الأسبوعي": weekly_report,
         "📅 التقرير التوضيحي الأسبوعي": weekly_report,
         "📝 التقرير التوضيحي اليومي": daily_report,
+        "📝 التوضيحي اليومي": daily_report,
         "📰 الأخبار": news_status,
         "💰 سعر الذهب": gold_price,
         "🌍 الأسواق": markets,
