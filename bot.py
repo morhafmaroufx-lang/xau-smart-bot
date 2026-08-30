@@ -963,11 +963,13 @@ def build_explanatory_report(timeframe="daily"):
         vals = [fmt(x) for x in targets if x is not None]
         return " ثم ".join(vals) if vals else "غير محددة من المستويات الحالية"
 
+    price_text = fmt(a["price"])
+
     lines = [
         f"📝 التقرير التوضيحي {label} — XAU/USD",
         "━━━━━━━━━━━━━━━━━━━━",
         f"🕐 توقيت دمشق: {now_damascus().strftime('%Y-%m-%d %H:%M')}",
-        f"💰 السعر الحالي: {price_text := fmt(a['price'])}",
+        f"💰 السعر الحالي: {price_text}",
         f"🎯 جودة السيناريو الرئيسي: {primary['quality']} نقطة / 100 — {quality_label}",
         f"🧭 الأفق: {horizon}",
         "",
