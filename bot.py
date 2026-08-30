@@ -1,9 +1,9 @@
 # ============================================================
-# XAU SMART TRADER v17.2
+# XAU SMART TRADER v18.0
 # Structural Liquidity + Quantitative Momentum
 # واجهة عربية بالكامل - توقيت دمشق
 #
-# v18.0:
+# v17.2:
 # - إصلاح كامل للتقرير الأسبوعي
 # - إضافة التقرير التوضيحي الأسبوعي
 # - إضافة التقرير التوضيحي اليومي
@@ -963,11 +963,14 @@ def build_explanatory_report(timeframe="daily"):
         vals = [fmt(x) for x in targets if x is not None]
         return " ثم ".join(vals) if vals else "غير محددة من المستويات الحالية"
 
+    # تعريف صريح لتجنب NameError في بيئات Python/Render المختلفة.
+    price_text = fmt(a["price"])
+
     lines = [
         f"📝 التقرير التوضيحي {label} — XAU/USD",
         "━━━━━━━━━━━━━━━━━━━━",
         f"🕐 توقيت دمشق: {now_damascus().strftime('%Y-%m-%d %H:%M')}",
-        f"💰 السعر الحالي: {price_text := fmt(a['price'])}",
+        f"💰 السعر الحالي: {price_text}",
         f"🎯 جودة السيناريو الرئيسي: {primary['quality']} نقطة / 100 — {quality_label}",
         f"🧭 الأفق: {horizon}",
         "",
@@ -1044,7 +1047,7 @@ async def start(update, context):
         ["📊 التحليل الكامل", "⚡ التحليل السريع"],
         ["🎯 صفقة الآن", "📍 الدعوم والمقاومات"],
         ["📝 التقرير التوضيحي اليومي", "📅 التقرير التوضيحي الأسبوعي"],
-        ["📅 التحليل الأسبوعي", "📊 التحليل اليومي"],
+        ["📅 التحليل الأسبوعي", "📝 التوضيحي اليومي"],
         ["📰 الأخبار", "💰 سعر الذهب"],
         ["🌍 الأسواق", "🔔 التنبيهات"],
         ["🟢 حالة النظام"]
@@ -1235,7 +1238,7 @@ async def router(update, context):
         "📅 التحليل الأسبوعي": weekly_report,
         "📅 التقرير التوضيحي الأسبوعي": weekly_report,
         "📝 التقرير التوضيحي اليومي": daily_report,
-        "📊 التحليل اليومي": full_analysis,
+        "📝 التوضيحي اليومي": daily_report,
         "📰 الأخبار": news_status,
         "💰 سعر الذهب": gold_price,
         "🌍 الأسواق": markets,
