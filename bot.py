@@ -839,197 +839,191 @@ def build_analysis():
 # التقرير التوضيحي — المحرك الأساسي
 # ============================================================
 
-def build_structural_analysis():
-    """مصدر موحد للتقرير اليومي والأسبوعي؛ يصلح أيضاً لتجنب أخطاء weekly_report القديمة."""
-    mtf = multi_timeframe()
-    quote = live_price()
-    levels = support_resistance(get_bars("1h", 250))
-    price = quote["price"]
+def _quality_label(score):
+    if score >= 80: return "قوية جداً"
+    if score >= 65: return "جيدة"
+    if score >= 50: return "متوسطة"
+    return "ضعيفة"
 
-    # جودة استراتيجية مستقلة عن شرط فتح صفقة.
-    buy_quality, buy_factors = scenario_quality(mtf, "BUY", levels, price, True)
-    sell_quality, sell_factors = scenario_quality(mtf, "SELL", levels, price, True)
 
-    if buy_quality > sell_quality:
-        bias_direction = "BUY"
-        score = buy_quality
-    elif sell_quality > buy_quality:
-        bias_direction = "SELL"
-        score = sell_quality
+def _scenario_score(frames_data, frames, direction, levels, price, atr):
+    """درجة سيناريو مستقلة للفترة المطلوبة، بدون خلط الفريمات."""
+    score = 0
+    factors = []
+    for name, weight in frames:
+        x = frames_data[name]
+        if x["direction"] == direction:
+            score += weight
+            factors.append(f"{name} داعم لل{'شراء' if direction == 'BUY' else 'بيع'}")
+        if direction == "BUY" and x["structure"] == "صاعد":
+            score += 5
+            factors.append(f"هيكل {name} صاعد")
+        elif direction == "SELL" and x["structure"] == "هابط":
+            score += 5
+            factors.append(f"هيكل {name} هابط")
+        if x["adx"] >= 25:
+            score += 3
+        if direction == "BUY" and x["rsi"] < 35:
+            score += 3
+        elif direction == "SELL" and x["rsi"] > 65:
+            score += 3
+
+    if direction == "BUY":
+        s = nearest_support(levels, price)
+        if s is not None and abs(price - s) <= max(atr * 1.8, price * 0.003):
+            score += 10; factors.append("السعر قريب من دعم مهم")
     else:
-        bias_direction = "WAIT"
-        score = max(buy_quality, sell_quality)
-
-    return {
-        "mtf": mtf,
-        "w1": mtf["w1"], "d1": mtf["d1"], "h4": mtf["h4"], "h1": mtf["h1"], "m15": mtf["m15"],
-        "price": price, "levels": levels,
-        "buy_quality": buy_quality, "sell_quality": sell_quality,
-        "buy_factors": buy_factors, "sell_factors": sell_factors,
-        "direction": bias_direction, "score": score
-    }
+        r = nearest_resistance(levels, price)
+        if r is not None and abs(price - r) <= max(atr * 1.8, price * 0.003):
+            score += 10; factors.append("السعر قريب من مقاومة مهمة")
+    return min(100, int(score)), factors
 
 
-def explanatory_scenarios(a, timeframe="daily"):
-    price = a["price"]
-    levels = a["levels"]
-    mtf = a["mtf"]
-    d = a["direction"]
+def _make_scenarios(frames_data, levels, price, atr, horizon):
+    if horizon == "weekly":
+        frame_defs = [("W1", 30), ("D1", 25), ("H4", 20)]
+    else:
+        frame_defs = [("H1", 30), ("M15", 25), ("M5", 20)]
+
+    def score(direction):
+        return _scenario_score(frames_data, frame_defs, direction, levels, price, atr)
+
+    buy_score, buy_factors = score("BUY")
+    sell_score, sell_factors = score("SELL")
+    direction = "BUY" if buy_score > sell_score else "SELL" if sell_score > buy_score else "WAIT"
 
     s1 = nearest_support(levels, price)
     s2 = next_support(levels, price)
     r1 = nearest_resistance(levels, price)
     r2 = next_resistance(levels, price)
 
-    if d == "BUY":
-        primary = {
-            "title": "الارتداد الصاعد / استمرار الأفضلية الشرائية",
-            "quality": a["buy_quality"],
-            "mechanism": (
-                f"السيناريو المفضل يعتمد على بقاء السعر فوق منطقة الدعم الأقرب "
-                f"({fmt(s1)}) مع استمرار أفضلية الاتجاه في D1/H4. "
-                "كلما ظهر تأكيد سعري عند الدعم تحسنت جودة الدخول بدلاً من مطاردة السعر."
-            ),
-            "trigger": f"ثبات السعر فوق {fmt(s1)} وظهور تأكيد صاعد على H1/M15." if s1 else "ظهور تأكيد صاعد على H1/M15 بالقرب من دعم واضح.",
-            "targets": [r1, r2],
-            "stop": s1,
-            "factors": a["buy_factors"]
-        }
-        alternative = {
-            "title": "السيناريو البديل — استمرار الهبوط",
-            "quality": a["sell_quality"],
-            "mechanism": f"يفقد السيناريو الصاعد قوته إذا كُسر الدعم {fmt(s1)} وأصبح التداول أسفله مستقراً، خصوصاً مع تزايد الزخم البيعي.",
-            "trigger": f"كسر واضح وإغلاق أسفل {fmt(s1)} ثم فشل السعر في استعادته." if s1 else "كسر آخر قاع واضح وإغلاق تحته.",
-            "targets": [s2, None],
-            "stop": r1,
-            "factors": a["sell_factors"]
-        }
-    elif d == "SELL":
-        primary = {
-            "title": "استمرار الضغط الهابط / البيع من المقاومة",
-            "quality": a["sell_quality"],
-            "mechanism": (
-                f"الأفضلية الحالية تميل للبيع طالما بقي السعر أسفل المقاومة الأقرب {fmt(r1)} "
-                "مع استمرار ضغط D1/H4. وتزداد جودة السيناريو عند ظهور رفض سعري من المقاومة."
-            ),
-            "trigger": f"رفض سعري واضح قرب {fmt(r1)} مع تأكيد هابط على H1/M15." if r1 else "ظهور تأكيد هابط من مقاومة واضحة.",
-            "targets": [s1, s2],
-            "stop": r1,
-            "factors": a["sell_factors"]
-        }
-        alternative = {
-            "title": "السيناريو البديل — ارتداد صاعد",
-            "quality": a["buy_quality"],
-            "mechanism": f"يتغير السيناريو إذا اخترق السعر المقاومة {fmt(r1)} وثبت فوقها، ما يفتح المجال لإعادة اختبار المقاومة التالية.",
-            "trigger": f"اختراق وإغلاق فوق {fmt(r1)} ثم تثبيت السعر أعلى المستوى." if r1 else "اختراق آخر قمة مهمة والثبات فوقها.",
-            "targets": [r2, None],
-            "stop": s1,
-            "factors": a["buy_factors"]
-        }
+    if direction == "BUY":
+        primary = {"title": "استمرار الاتجاه الصاعد / بناء مركز شراء", "quality": buy_score,
+                   "mechanism": f"تبقى الرؤية الشرائية مفضلة ما دام السعر يحافظ على منطقة الدعم {fmt(s1)} ولا يظهر كسر هيكلي هابط مؤكد.",
+                   "trigger": f"تثبيت السعر فوق {fmt(s1)} مع تأكيد الاتجاه على الفريمات المعنية.",
+                   "targets": [r1, r2], "stop": s1, "factors": buy_factors}
+        alternative = {"title": "السيناريو البديل — تحول هابط", "quality": sell_score,
+                       "mechanism": f"يتحول الميزان إلى الهبوط عند فقدان الدعم {fmt(s1)} مع تأكيد كسر هيكلي وليس مجرد ذيل سعري.",
+                       "trigger": f"إغلاق واضح أسفل {fmt(s1)} ثم فشل استعادة المستوى.",
+                       "targets": [s2, None], "stop": r1, "factors": sell_factors}
+    elif direction == "SELL":
+        primary = {"title": "استمرار الاتجاه الهابط / البيع من المقاومة", "quality": sell_score,
+                   "mechanism": f"تبقى الرؤية البيعية مفضلة ما دام السعر أسفل المقاومة {fmt(r1)} والهيكل يدعم الضغط الهابط.",
+                   "trigger": f"رفض سعري وتأكيد هابط أسفل {fmt(r1)}." if r1 else "تأكيد هابط من منطقة مقاومة واضحة.",
+                   "targets": [s1, s2], "stop": r1, "factors": sell_factors}
+        alternative = {"title": "السيناريو البديل — استعادة الاتجاه الصاعد", "quality": buy_score,
+                       "mechanism": f"يتحول الميزان إذا اخترق السعر {fmt(r1)} وثبت فوقه مع تحسن الهيكل والزخم.",
+                       "trigger": f"إغلاق فوق {fmt(r1)} ثم تثبيت المستوى." if r1 else "اختراق قمة مهمة والثبات فوقها.",
+                       "targets": [r2, None], "stop": s1, "factors": buy_factors}
     else:
-        primary = {
-            "title": "سيناريو الانتظار — السوق بلا أفضلية كافية",
-            "quality": a["score"],
-            "mechanism": "الفريمات لا تعطي أفضلية اتجاهية كافية؛ لذلك تكون مناطق الدعم والمقاومة أهم من محاولة توقع الحركة مسبقاً.",
-            "trigger": "انتظار اختراق مقاومة مع تثبيت أو كسر دعم مع تثبيت ثم إعادة تقييم الاتجاه.",
-            "targets": [r1, r2],
-            "stop": None,
-            "factors": []
-        }
-        alternative = {
-            "title": "السيناريو البديل — الحركة داخل النطاق",
-            "quality": max(a["buy_quality"], a["sell_quality"]),
-            "mechanism": f"قد يستمر التداول بين الدعم {fmt(s1)} والمقاومة {fmt(r1)} إلى أن يظهر محفز قوي.",
-            "trigger": "ظهور توسع في الزخم والحجم مع كسر أحد طرفي النطاق.",
-            "targets": [s1, r1],
-            "stop": None,
-            "factors": []
-        }
-
-    return primary, alternative
+        primary = {"title": "سيناريو الانتظار — لا أفضلية اتجاهية كافية", "quality": max(buy_score, sell_score),
+                   "mechanism": "الفريمات المحددة لا تمنح أفضلية واضحة؛ القرار يعتمد على كسر أحد طرفي النطاق مع تأكيد.",
+                   "trigger": f"كسر {fmt(r1)} صعوداً أو {fmt(s1)} هبوطاً مع تثبيت السعر.",
+                   "targets": [r1, r2], "stop": None, "factors": []}
+        alternative = {"title": "السيناريو البديل — استمرار التذبذب", "quality": max(buy_score, sell_score),
+                       "mechanism": f"قد يبقى الذهب داخل النطاق بين {fmt(s1)} و{fmt(r1)} حتى يظهر محفز أقوى.",
+                       "trigger": "توسع واضح في الزخم والحجم ثم كسر النطاق.",
+                       "targets": [s1, r1], "stop": None, "factors": []}
+    return primary, alternative, buy_score, sell_score
 
 
-def build_explanatory_report(timeframe="daily"):
-    a = build_structural_analysis()
-    primary, alternative = explanatory_scenarios(a, timeframe)
-    mtf = a["mtf"]
-    levels = a["levels"]
-
-    label = "اليومي" if timeframe == "daily" else "الأسبوعي"
-    horizon = "الحركة خلال اليوم" if timeframe == "daily" else "الحركة المحتملة خلال الأسبوع"
-    quality_label = "قوية جداً" if primary["quality"] >= 80 else "جيدة" if primary["quality"] >= 65 else "متوسطة" if primary["quality"] >= 50 else "ضعيفة"
-
+def _format_explanatory_report(frames_data, levels, price, primary, alternative, horizon, extra_lines):
     def target_text(targets):
         vals = [fmt(x) for x in targets if x is not None]
         return " ثم ".join(vals) if vals else "غير محددة من المستويات الحالية"
 
-    # تعريف صريح لتجنب NameError في بيئات Python/Render المختلفة.
-    price_text = fmt(a["price"])
-
+    label = "الأسبوعي" if horizon == "weekly" else "اليومي"
     lines = [
-        f"📝 التقرير التوضيحي {label} — XAU/USD",
-        "━━━━━━━━━━━━━━━━━━━━",
+        f"📝 التقرير التوضيحي {label} — XAU/USD", "━━━━━━━━━━━━━━━━━━━━",
         f"🕐 توقيت دمشق: {now_damascus().strftime('%Y-%m-%d %H:%M')}",
-        f"💰 السعر الحالي: {price_text}",
-        f"🎯 جودة السيناريو الرئيسي: {primary['quality']} نقطة / 100 — {quality_label}",
-        f"🧭 الأفق: {horizon}",
-        "",
-        "🟢 السيناريو الأول — المرجح",
-        "━━━━━━━━━━━━━━━━━━━━",
-        f"{primary['title']}",
+        f"💰 السعر الحالي: {fmt(price)}",
+        f"🎯 جودة السيناريو الرئيسي: {primary['quality']} نقطة / 100 — {_quality_label(primary['quality'])}",
+        f"🧭 الأفق: {'الاستراتيجية المحتملة خلال الأسبوع' if horizon == 'weekly' else 'الحركة المحتملة خلال اليوم'}",
+        ""
+    ]
+    lines.extend(extra_lines)
+    lines += [
+        "🟢 السيناريو الأول — المرجح", "━━━━━━━━━━━━━━━━━━━━",
+        primary["title"],
         f"• الآلية: {primary['mechanism']}",
         f"• شرط التفعيل: {primary['trigger']}",
         f"• الأهداف المحتملة: {target_text(primary['targets'])}",
         f"• مستوى إبطال الفكرة: {fmt(primary['stop'])}",
     ]
-
     if primary["factors"]:
         lines.append("• أسباب الترجيح:")
-        lines.extend("  - " + x for x in primary["factors"][:6])
-
-    lines += [
-        "",
-        "🔴 السيناريو الثاني — البديل",
-        "━━━━━━━━━━━━━━━━━━━━",
-        f"{alternative['title']}",
-        f"• الآلية: {alternative['mechanism']}",
-        f"• شرط التحول: {alternative['trigger']}",
-        f"• الأهداف المحتملة: {target_text(alternative['targets'])}",
-        f"• جودة السيناريو البديل: {alternative['quality']} نقطة / 100",
-        "",
-        "📍 خريطة القرار السعري",
-        "━━━━━━━━━━━━━━━━━━━━",
-        f"🟢 S1: {format_zone(levels, 'support1')}",
-        f"🟢 S2: {format_zone(levels, 'support2')}",
-        f"🟢 S3: {format_zone(levels, 'support3')}",
-        f"🔴 R1: {format_zone(levels, 'resistance1')}",
-        f"🔴 R2: {format_zone(levels, 'resistance2')}",
-        f"🔴 R3: {format_zone(levels, 'resistance3')}",
-        "",
-        "🗒 خطة العمل المقترحة",
-        "━━━━━━━━━━━━━━━━━━━━",
-        "• لا تتم مطاردة السعر بعد حركة قوية بعيدة عن منطقة القرار.",
-        "• تتم مراقبة Price Action عند الدعم أو المقاومة الأقرب.",
-        "• لا يعتمد الدخول على مؤشر منفرد؛ المطلوب توافق الاتجاه + الهيكل + الزخم + المنطقة.",
-        "• إذا كُسر مستوى القرار وثبت السعر خارجه، يتم الانتقال إلى السيناريو البديل.",
-        "• جودة السيناريو بالنقاط هي مقياس تحليلي وليست احتمالاً مضموناً للربح.",
-        "",
-        "🧠 ملخص الفريمات",
-        f"W1: {mtf['w1']['direction']} | D1: {mtf['d1']['direction']} | H4: {mtf['h4']['direction']} | H1: {mtf['h1']['direction']} | M15: {mtf['m15']['direction']}",
-        f"📊 درجة التوافق متعددة الفريمات: {mtf['score']} نقطة",
-        "",
-        "⚠️ التقرير يشرح السيناريوهات التي تستنتجها البيانات الحالية ولا يضمن اتجاه السوق أو الربح."
-    ]
+        lines.extend("  - " + x for x in primary["factors"][:7])
+    lines += ["", "🔴 السيناريو الثاني — البديل", "━━━━━━━━━━━━━━━━━━━━",
+              alternative["title"], f"• الآلية: {alternative['mechanism']}",
+              f"• شرط التحول: {alternative['trigger']}",
+              f"• الأهداف المحتملة: {target_text(alternative['targets'])}",
+              f"• جودة السيناريو البديل: {alternative['quality']} نقطة / 100", "",
+              "📍 خريطة القرار السعري", "━━━━━━━━━━━━━━━━━━━━",
+              f"🟢 S1: {format_zone(levels, 'support1')}",
+              f"🟢 S2: {format_zone(levels, 'support2')}",
+              f"🟢 S3: {format_zone(levels, 'support3')}",
+              f"🔴 R1: {format_zone(levels, 'resistance1')}",
+              f"🔴 R2: {format_zone(levels, 'resistance2')}",
+              f"🔴 R3: {format_zone(levels, 'resistance3')}", "",
+              "🗒 خطة العمل المقترحة", "━━━━━━━━━━━━━━━━━━━━"]
+    if horizon == "weekly":
+        lines += ["• قراءة W1 أولاً لتحديد اتجاه الأسبوع قبل التفكير في الدخول.",
+                  "• D1 يحدد ما إذا كان الاتجاه الأسبوعي يكتسب دعماً أم يفقده.",
+                  "• H4 يستخدم لتحديد منطقة التنفيذ الاستراتيجي، وليس M15 لتحديد اتجاه الأسبوع.",
+                  "• الإغلاق الأسبوعي فوق/تحت مستويات القرار هو العامل الأهم لتغيير السيناريو."]
+    else:
+        lines += ["• مراقبة السيولة والزخم على H1 ثم M15 ثم M5.",
+                  "• لا تتم مطاردة السعر بعد حركة قوية بعيدة عن منطقة القرار.",
+                  "• المطلوب توافق الاتجاه + الهيكل + الزخم + المنطقة قبل الدخول.",
+                  "• كسر مستوى القرار مع تثبيت السعر ينقلنا إلى السيناريو البديل."]
+    lines += ["", "🧠 ملخص الفريمات", " | ".join(f"{k}: {v['direction']}" for k, v in frames_data.items()),
+              "", "⚠️ جودة السيناريو مقياس تحليلي وليست احتمالاً مضموناً للربح."]
     return "\n".join(lines)
 
 
-def build_weekly_report():
-    """إصلاح التقرير الأسبوعي: لا يعتمد على دوال غير موجودة في v17.1."""
-    return build_explanatory_report("weekly")
+def build_daily_analysis():
+    """التحليل اليومي: H1 + M15 + M5 للحركة داخل اليوم."""
+    h1 = analyze(get_bars("1h", 300)); m15 = analyze(get_bars("15m", 300)); m5 = analyze(get_bars("5m", 300))
+    q = live_price(); price = q["price"]; levels = support_resistance(get_bars("1h", 250))
+    frames = {"H1": h1, "M15": m15, "M5": m5}
+    buy, _ = _scenario_score([("H1",35),("M15",30),("M5",25)], "BUY", levels, price, m15["atr"])
+    sell, _ = _scenario_score([("H1",35),("M15",30),("M5",25)], "SELL", levels, price, m15["atr"])
+    direction = "BUY" if buy > sell else "SELL" if sell > buy else "WAIT"
+    return f"📊 التحليل اليومي {VERSION}\n━━━━━━━━━━━━━━━━━━\n💰 السعر: {price:.2f}\n🎯 التوجيه: {'🟢 شراء' if direction=='BUY' else '🔴 بيع' if direction=='SELL' else '🟡 انتظار'}\n💪 قوة اليوم: {max(buy,sell)} نقطة\n\nH1: {h1['direction']} | RSI {h1['rsi']:.1f} | ADX {h1['adx']:.1f}\nM15: {m15['direction']} | RSI {m15['rsi']:.1f} | ADX {m15['adx']:.1f}\nM5: {m5['direction']} | RSI {m5['rsi']:.1f} | ADX {m5['adx']:.1f}\n\n📍 S1: {format_zone(levels,'support1')}\n📍 R1: {format_zone(levels,'resistance1')}"
+
+
+def build_weekly_analysis():
+    """التحليل الأسبوعي: W1 + D1 + H4 فقط."""
+    w1 = analyze(get_bars("1w", 250)); d1 = analyze(get_bars("1d", 300)); h4 = analyze(get_bars("4h", 300))
+    q = live_price(); price = q["price"]; levels = support_resistance(get_bars("1d", 250))
+    frames = {"W1": w1, "D1": d1, "H4": h4}
+    buy, _ = _scenario_score([("W1",35),("D1",30),("H4",25)], "BUY", levels, price, d1["atr"])
+    sell, _ = _scenario_score([("W1",35),("D1",30),("H4",25)], "SELL", levels, price, d1["atr"])
+    direction = "BUY" if buy > sell else "SELL" if sell > buy else "WAIT"
+    return f"📅 التحليل الأسبوعي {VERSION}\n━━━━━━━━━━━━━━━━━━\n💰 السعر: {price:.2f}\n🎯 الاتجاه الاستراتيجي: {'🟢 شراء' if direction=='BUY' else '🔴 بيع' if direction=='SELL' else '🟡 حياد'}\n💪 قوة الاتجاه: {max(buy,sell)} نقطة\n\nW1: {w1['direction']} | قوة {w1['score']} | RSI {w1['rsi']:.1f} | ADX {w1['adx']:.1f}\nD1: {d1['direction']} | قوة {d1['score']} | RSI {d1['rsi']:.1f} | ADX {d1['adx']:.1f}\nH4: {h4['direction']} | قوة {h4['score']} | RSI {h4['rsi']:.1f} | ADX {h4['adx']:.1f}\n\n📍 الدعم الأسبوعي: {format_zone(levels,'support1')}\n📍 المقاومة الأسبوعية: {format_zone(levels,'resistance1')}"
 
 
 def build_daily_report():
-    return build_explanatory_report("daily")
+    frames_data = {"H1": analyze(get_bars("1h",300)), "M15": analyze(get_bars("15m",300)), "M5": analyze(get_bars("5m",300))}
+    q = live_price(); price=q["price"]; levels=support_resistance(get_bars("1h",250)); atr=frames_data["M15"]["atr"]
+    primary, alternative, _, _ = _make_scenarios(frames_data, levels, price, atr, "daily")
+    return _format_explanatory_report(frames_data, levels, price, primary, alternative, "daily", [
+        "📌 التركيز: الاتجاه داخل اليوم وليس الاتجاه الاستراتيجي الطويل.",
+        "⏱ تسلسل القرار: H1 للسياق → M15 للتأكيد → M5 للزناد."])
+
+
+def build_weekly_report():
+    frames_data = {"W1": analyze(get_bars("1w",250)), "D1": analyze(get_bars("1d",300)), "H4": analyze(get_bars("4h",300))}
+    q = live_price(); price=q["price"]; levels=support_resistance(get_bars("1d",250)); atr=frames_data["D1"]["atr"]
+    primary, alternative, _, _ = _make_scenarios(frames_data, levels, price, atr, "weekly")
+    return _format_explanatory_report(frames_data, levels, price, primary, alternative, "weekly", [
+        "📌 التركيز: اتجاه الأسبوع وبناء الرؤية الاستراتيجية.",
+        f"📊 W1: {frames_data['W1']['direction']} | D1: {frames_data['D1']['direction']} | H4: {frames_data['H4']['direction']}",
+        "🧭 لا يدخل M15 أو M5 في تحديد الاتجاه الاستراتيجي الأسبوعي."])
+
+
+def build_explanatory_report(timeframe="daily"):
+    return build_weekly_report() if timeframe == "weekly" else build_daily_report()
 
 # ============================================================
 # أوامر Telegram
@@ -1044,8 +1038,9 @@ async def reply(update, text):
 
 async def start(update, context):
     keyboard = [
-        ["📊 التحليل الكامل", "⚡ التحليل السريع"],
-        ["🎯 صفقة الآن", "📍 الدعوم والمقاومات"],
+        ["📊 التحليل الكامل", "📊 التحليل اليومي"],
+        ["⚡ التحليل السريع", "🎯 صفقة الآن"],
+        ["📍 الدعوم والمقاومات"],
         ["📝 التقرير التوضيحي اليومي", "📅 التقرير التوضيحي الأسبوعي"],
         ["📅 التحليل الأسبوعي", "📝 التوضيحي اليومي"],
         ["📰 الأخبار", "💰 سعر الذهب"],
@@ -1137,6 +1132,22 @@ async def gold_price(update, context):
         await reply(update, f"💰 XAU/USD — السعر اللحظي\n\nالسعر: {q['price']:.2f}\nالمصدر: {q['source']}\nعمر السعر: {q.get('age')}\nتوقيت دمشق: {now_damascus().strftime('%Y-%m-%d %H:%M:%S')}")
     except Exception as e:
         await reply(update, f"❌ تعذر جلب السعر: {e}")
+
+
+async def daily_analysis(update, context):
+    try:
+        await reply(update, await asyncio.to_thread(build_daily_analysis))
+    except Exception as e:
+        logger.exception("Daily analysis error")
+        await reply(update, f"❌ تعذر إنشاء التحليل اليومي.\nالسبب: {e}")
+
+
+async def weekly_analysis(update, context):
+    try:
+        await reply(update, await asyncio.to_thread(build_weekly_analysis))
+    except Exception as e:
+        logger.exception("Weekly analysis error")
+        await reply(update, f"❌ تعذر إنشاء التحليل الأسبوعي.\nالسبب: {e}")
 
 
 async def weekly_report(update, context):
@@ -1235,10 +1246,11 @@ async def router(update, context):
         "⚡ التحليل السريع": quick_analysis,
         "🎯 صفقة الآن": trade_now,
         "📍 الدعوم والمقاومات": show_levels,
-        "📅 التحليل الأسبوعي": weekly_report,
+        "📅 التحليل الأسبوعي": weekly_analysis,
         "📅 التقرير التوضيحي الأسبوعي": weekly_report,
         "📝 التقرير التوضيحي اليومي": daily_report,
         "📝 التوضيحي اليومي": daily_report,
+        "📊 التحليل اليومي": daily_analysis,
         "📰 الأخبار": news_status,
         "💰 سعر الذهب": gold_price,
         "🌍 الأسواق": markets,
