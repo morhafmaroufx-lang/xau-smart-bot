@@ -1,5 +1,5 @@
 # ============================================================
-# XAU SMART TRADER v17.2
+# XAU SMART TRADER v18.0
 # Structural Liquidity + Quantitative Momentum
 # واجهة عربية بالكامل - توقيت دمشق
 #
@@ -967,7 +967,7 @@ def build_explanatory_report(timeframe="daily"):
         f"📝 التقرير التوضيحي {label} — XAU/USD",
         "━━━━━━━━━━━━━━━━━━━━",
         f"🕐 توقيت دمشق: {now_damascus().strftime('%Y-%m-%d %H:%M')}",
-        f"💰 السعر الحالي: {fmt(a['price'])}",
+        f"💰 السعر الحالي: {price_text := fmt(a['price'])}",
         f"🎯 جودة السيناريو الرئيسي: {primary['quality']} نقطة / 100 — {quality_label}",
         f"🧭 الأفق: {horizon}",
         "",
