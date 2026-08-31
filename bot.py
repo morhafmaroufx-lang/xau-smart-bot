@@ -1457,7 +1457,8 @@ async def start_bot():
 
     APPLICATION = Application.builder().token(TOKEN).build()
     APPLICATION.add_handler(CommandHandler("start", start))
-    APPLICATION.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, router))
+APPLICATION.add_handler(CallbackQueryHandler(plan_callback, pattern=r"^plan_"))
+APPLICATION.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, router))
 
     await APPLICATION.initialize()
     await APPLICATION.start()
