@@ -1185,6 +1185,17 @@ async def reply(update, text):
 
 
 async def start(update, context):
+    async def start(update, context):
+    # 👤 تسجيل المستخدم تلقائياً في نظام الاشتراكات
+    create_free_user(
+        update.effective_chat.id,
+        update.effective_user.username,
+        update.effective_user.first_name
+    )
+
+    keyboard = [
+        ["📊 التحليل الكامل", "📊 التحليل اليومي"],
+        ["⚡ التحليل السريع", "🎯 صفقة الآن"]
     keyboard = [
         ["📊 التحليل الكامل", "📊 التحليل اليومي"],
         ["⚡ التحليل السريع", "🎯 صفقة الآن"],
