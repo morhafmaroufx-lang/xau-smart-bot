@@ -1534,20 +1534,12 @@ async def start_bot():
         raise RuntimeError("TELEGRAM_TOKEN غير موجود في Render.")
 
     APPLICATION = Application.builder().token(TOKEN).build()
+
     APPLICATION.add_handler(CommandHandler("start", start))
-APPLICATION.add_handler(CallbackQueryHandler(plan_callback, pattern=r"^plan_"))
-APPLICATION.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, router))
+    APPLICATION.add_handler(CallbackQueryHandler(plan_callback, pattern=r"^plan_"))
+    APPLICATION.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, router))
 
     await APPLICATION.initialize()
-    await APPLICATION.start()
-    await APPLICATION.bot.set_webhook(url=WEBHOOK_URL, allowed_updates=["message"], drop_pending_updates=True)
-
-    logger.info("XAU SMART TRADER %s started", VERSION)
-    logger.info("Webhook: %s", WEBHOOK_URL)
-    asyncio.create_task(auto_loop())
-
-    while True:
-        await asyncio.sleep(3600)
 
 # ============================================================
 # Flask Server
