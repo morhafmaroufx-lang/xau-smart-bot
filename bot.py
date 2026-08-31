@@ -120,6 +120,105 @@ TRADE_LIMITS = {
     "PREMIUM": 50,
     "VIP": None,
 }
+# ============================================================
+# 💳 قاعدة بيانات المستخدمين والاشتراكات
+# ============================================================
+
+SUBSCRIPTION_DB = "subscriptions.db"
+
+
+def init_subscription_db():
+    conn = sqlite3.connect(SUBSCRIPTION_DB)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS subscribers (
+            chat_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            plan TEXT NOT NULL DEFAULT 'FREE',
+            status TEXT NOT NULL DEFAULT 'active',
+            start_date TEXT,
+            expiry_date TEXT,
+            trades_used INTEGER DEFAULT 0,
+            referral_code TEXT,
+            referred_by INTEGER
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def get_subscription(chat_id):
+    conn = sqlite3.connect(SUBSCRIPTION_DB)
+    conn.row_factory = sqlite3.Row
+
+    row = conn.execute(
+        "SELECT * FROM subscribers WHERE chat_id = ?",
+        (chat_id,)
+    ).fetchone()
+
+    conn.close()
+    return row
+
+
+def create_free_user(chat_id, username=None, first_name=None):
+    if get_subscription(chat_id):
+        return
+
+    conn = sqlite3.connect(SUBSCRIPTION_DB)
+
+    conn.execute("""
+        INSERT INTO subscribers (
+            chat_id,
+            username,
+            first_name,
+            plan,
+            status,
+            start_date,
+            trades_used,
+            referral_code
+        )
+        VALUES (?, ?, ?, 'FREE', 'active', ?, 0, ?)
+    """, (
+        chat_id,
+        username,
+        first_name,
+        datetime.now().isoformat(),
+        f"REF{chat_id}"
+    ))
+
+    conn.commit()
+    conn.close()
+
+
+def get_user_plan(chat_id):
+    user = get_subscription(chat_id)
+
+    if not user:
+        return "FREE"
+
+    return user["plan"]
+
+
+def is_subscription_active(chat_id):
+    user = get_subscription(chat_id)
+
+    if not user:
+        return True
+
+    if user["plan"] == "FREE":
+        return True
+
+    if not user["expiry_date"]:
+        return False
+
+    try:
+        expiry = datetime.fromisoformat(user["expiry_date"])
+        return datetime.now() < expiry
+    except Exception:
+        return False
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
