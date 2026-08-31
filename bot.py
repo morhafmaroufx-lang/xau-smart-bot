@@ -70,7 +70,55 @@ NEWS_FILTER_ENABLED = os.environ.get("NEWS_FILTER_ENABLED", "true").lower() == "
 NEWS_BEFORE_MIN = 30
 NEWS_AFTER_MIN = 30
 NEWS_CACHE_SECONDS = 300
+# ============================================================
+# 💳 نظام الاشتراكات - الباقات والأسعار
+# ============================================================
 
+PLANS = {
+    "FREE": {
+        "name": "🆓 FREE",
+        "price": 0,
+        "trade_limit": 1,
+        "trade_period_days": 7,
+    },
+
+    "BASIC": {
+        "name": "🥉 BASIC",
+        "price": 10,
+        "trade_limit": 5,
+        "trade_period_days": 30,
+    },
+
+    "PRO": {
+        "name": "🥈 PRO",
+        "price": 20,
+        "trade_limit": 20,
+        "trade_period_days": 30,
+    },
+
+    "PREMIUM": {
+        "name": "🥇 PREMIUM",
+        "price": 35,
+        "trade_limit": 50,
+        "trade_period_days": 30,
+    },
+
+    "VIP": {
+        "name": "💎 VIP",
+        "price": 50,
+        "trade_limit": None,
+        "trade_period_days": 30,
+    },
+}
+
+# الحد الأقصى للصفقات حسب الباقة
+TRADE_LIMITS = {
+    "FREE": 1,
+    "BASIC": 5,
+    "PRO": 20,
+    "PREMIUM": 50,
+    "VIP": None,
+}
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
