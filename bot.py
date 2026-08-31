@@ -29,7 +29,7 @@ import numpy as np
 
 from flask import Flask, request, jsonify
 from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, CallbackQueryHandler, filters
 
 # ============================================================
 # الإعدادات
