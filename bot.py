@@ -19,6 +19,7 @@ import threading
 import time
 import logging
 import json
+import sqlite3
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
