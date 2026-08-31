@@ -1450,6 +1450,84 @@ def webhook():
 # تشغيل Telegram
 # ============================================================
 
+async def plan_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    plan_key = query.data.replace("plan_", "")
+    plan = PLANS.get(plan_key)
+
+    if not plan:
+        await query.edit_message_text("❌ الباقة غير موجودة.")
+        return
+
+    if plan_key == "FREE":
+        details = (
+            "• 📊 التحليل الأساسي\n"
+            "• 🎯 صفقة واحدة\n"
+            "• 📅 مدة 7 أيام\n"
+        )
+    elif plan_key == "BASIC":
+        details = (
+            "• 📊 التحليل اليومي\n"
+            "• 📅 التحليل الأسبوعي\n"
+            "• 📍 الدعوم والمقاومات\n"
+            "• 🎯 5 صفقات شهرياً\n"
+        )
+    elif plan_key == "PRO":
+        details = (
+            "• 📊 جميع التحليلات الأساسية\n"
+            "• 🧠 تحليل هيكلي وكمي\n"
+            "• 📍 الدعوم والمقاومات\n"
+            "• 🎯 20 صفقة شهرياً\n"
+            "• 🔔 تنبيهات الصفقات\n"
+        )
+    elif plan_key == "PREMIUM":
+        details = (
+            "• 📊 جميع التحليلات\n"
+            "• 🧠 التحليل المؤسسي والكمي\n"
+            "• 📍 جميع مستويات S/R\n"
+            "• 🎯 50 صفقة شهرياً\n"
+            "• 🔔 تنبيهات الأخبار والصفقات\n"
+        )
+    else:  # VIP
+        details = (
+            "• 📊 جميع التحليلات\n"
+            "• 🧠 التحليل المؤسسي والكمي الكامل\n"
+            "• 📍 جميع مستويات S/R\n"
+            "• 🎯 صفقات غير محدودة\n"
+            "• 🔔 جميع التنبيهات\n"
+            "• 💎 وصول VIP الكامل\n"
+        )
+
+    price = plan["price"]
+    days = plan["trade_period_days"]
+
+    text = (
+        f"{plan['name']}\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"💰 السعر: ${price} / شهر\n"
+        f"📅 المدة: {days} يوم\n\n"
+        "🔐 ما تحصل عليه:\n"
+        f"{details}\n"
+        "👇 اختر الإجراء:"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton(
+            f"✅ الاشتراك في {plan['name']}",
+            callback_data=f"subscribe_{plan_key}"
+        )],
+        [InlineKeyboardButton(
+            "🔙 العودة للباقات",
+            callback_data="back_to_plans"
+        )]
+    ]
+
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 async def start_bot():
     global APPLICATION
     if not TOKEN:
