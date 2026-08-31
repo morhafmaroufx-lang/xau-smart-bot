@@ -1466,6 +1466,7 @@ def run_flask():
 # ============================================================
 
 def main():
+        init_subscription_db()
     global BOT_LOOP
     server = threading.Thread(target=run_flask, daemon=True)
     server.start()
