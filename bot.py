@@ -1528,6 +1528,40 @@ async def plan_callback(update, context):
         text,
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
+async def plans(update, context):
+    _ensure_user(update)
+    
+if query.data == "back_to_plans":
+    await plans(update, context)
+    return
+    text = (
+        "💳 نظام الاشتراكات\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "اختر الباقة المناسبة لك 👇\n\n"
+        "🥉 BASIC — $10 / شهر\n"
+        "🥈 PRO — $20 / شهر\n"
+        "🥇 PREMIUM — $35 / شهر\n"
+        "💎 VIP — $50 / شهر\n\n"
+        "⬇️ اضغط على الباقة لمعرفة تفاصيلها:"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("🥉 BASIC — $10", callback_data="plan_BASIC")],
+        [InlineKeyboardButton("🥈 PRO — $20", callback_data="plan_PRO")],
+        [InlineKeyboardButton("🥇 PREMIUM — $35", callback_data="plan_PREMIUM")],
+        [InlineKeyboardButton("💎 VIP — $50", callback_data="plan_VIP")],
+    ]
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    else:
+        await update.message.reply_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 async def start_bot():
     global APPLICATION
     if not TOKEN:
