@@ -1407,6 +1407,8 @@ async def router(update, context):
         "📊 التحليل الكامل": full_analysis,
         "⚡ التحليل السريع": quick_analysis,
         "🎯 صفقة الآن": trade_now,
+        "💳 الباقات": plans,
+        "👤 اشتراكي": my_subscription,
         "📍 الدعوم والمقاومات": show_levels,
         "📅 التحليل الأسبوعي": weekly_analysis,
         "📅 التقرير التوضيحي الأسبوعي": weekly_report,
