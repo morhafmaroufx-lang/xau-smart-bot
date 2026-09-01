@@ -1335,51 +1335,211 @@ def _scenario_score(frames_data, frames, direction, levels, price, atr):
 
 
 def _make_scenarios(frames_data, levels, price, atr, horizon):
+
     if horizon == "weekly":
-        frame_defs = [("W1", 30), ("D1", 25), ("H4", 20)]
+        frame_defs = [
+            ("W1", 30),
+            ("D1", 25),
+            ("H4", 20),
+        ]
     else:
-        frame_defs = [("H1", 30), ("M15", 25), ("M5", 20)]
+        frame_defs = [
+            ("H1", 30),
+            ("M15", 25),
+            ("M5", 20),
+        ]
 
     def score(direction):
-        return _scenario_score(frames_data, frame_defs, direction, levels, price, atr)
+        return _scenario_score(
+            frames_data,
+            frame_defs,
+            direction,
+            levels,
+            price,
+            atr
+        )
 
     buy_score, buy_factors = score("BUY")
     sell_score, sell_factors = score("SELL")
-    direction = "BUY" if buy_score > sell_score else "SELL" if sell_score > buy_score else "WAIT"
 
+    direction = (
+        "BUY"
+        if buy_score > sell_score
+        else "SELL"
+        if sell_score > buy_score
+        else "WAIT"
+    )
+
+    # المستويات أصبحت مضمونة الاتجاه:
+    # دعم تحت السعر / مقاومة فوق السعر
     s1 = nearest_support(levels, price)
     s2 = next_support(levels, price)
+
     r1 = nearest_resistance(levels, price)
     r2 = next_resistance(levels, price)
 
     if direction == "BUY":
-        primary = {"title": "استمرار الاتجاه الصاعد / بناء مركز شراء", "quality": buy_score,
-                   "mechanism": f"تبقى الرؤية الشرائية مفضلة ما دام السعر يحافظ على منطقة الدعم {fmt(s1)} ولا يظهر كسر هيكلي هابط مؤكد.",
-                   "trigger": f"تثبيت السعر فوق {fmt(s1)} مع تأكيد الاتجاه على الفريمات المعنية.",
-                   "targets": [r1, r2], "stop": s1, "factors": buy_factors}
-        alternative = {"title": "السيناريو البديل — تحول هابط", "quality": sell_score,
-                       "mechanism": f"يتحول الميزان إلى الهبوط عند فقدان الدعم {fmt(s1)} مع تأكيد كسر هيكلي وليس مجرد ذيل سعري.",
-                       "trigger": f"إغلاق واضح أسفل {fmt(s1)} ثم فشل استعادة المستوى.",
-                       "targets": [s2, None], "stop": r1, "factors": sell_factors}
+
+        primary = {
+            "title": "استمرار الاتجاه الصاعد / بناء مركز شراء",
+            "quality": buy_score,
+
+            "mechanism": (
+                f"تبقى الرؤية الشرائية مفضلة "
+                f"ما دام السعر يحافظ على الدعم {fmt(s1)} "
+                f"ولا يظهر كسر هيكلي هابط مؤكد."
+            ),
+
+            "trigger": (
+                f"تثبيت السعر فوق {fmt(s1)} "
+                f"مع تأكيد الاتجاه على الفريمات المعنية."
+            ),
+
+            "targets": [
+                r1,
+                r2
+            ],
+
+            "stop": s1,
+            "factors": buy_factors,
+        }
+
+        alternative = {
+            "title": "السيناريو البديل — تحول هابط",
+            "quality": sell_score,
+
+            "mechanism": (
+                f"يتحول الميزان إلى الهبوط "
+                f"عند فقدان الدعم {fmt(s1)} "
+                f"مع تأكيد كسر هيكلي."
+            ),
+
+            "trigger": (
+                f"إغلاق واضح أسفل {fmt(s1)} "
+                f"ثم فشل استعادة المستوى."
+            ),
+
+            "targets": [
+                s2
+            ],
+
+            "stop": r1,
+            "factors": sell_factors,
+        }
+
     elif direction == "SELL":
-        primary = {"title": "استمرار الاتجاه الهابط / البيع من المقاومة", "quality": sell_score,
-                   "mechanism": f"تبقى الرؤية البيعية مفضلة ما دام السعر أسفل المقاومة {fmt(r1)} والهيكل يدعم الضغط الهابط.",
-                   "trigger": f"رفض سعري وتأكيد هابط أسفل {fmt(r1)}." if r1 else "تأكيد هابط من منطقة مقاومة واضحة.",
-                   "targets": [s1, s2], "stop": r1, "factors": sell_factors}
-        alternative = {"title": "السيناريو البديل — استعادة الاتجاه الصاعد", "quality": buy_score,
-                       "mechanism": f"يتحول الميزان إذا اخترق السعر {fmt(r1)} وثبت فوقه مع تحسن الهيكل والزخم.",
-                       "trigger": f"إغلاق فوق {fmt(r1)} ثم تثبيت المستوى." if r1 else "اختراق قمة مهمة والثبات فوقها.",
-                       "targets": [r2, None], "stop": s1, "factors": buy_factors}
+
+        primary = {
+            "title": "استمرار الاتجاه الهابط / البيع من المقاومة",
+            "quality": sell_score,
+
+            "mechanism": (
+                f"تبقى الرؤية البيعية مفضلة "
+                f"ما دام السعر أسفل المقاومة {fmt(r1)} "
+                f"والهيكل يدعم الضغط الهابط."
+            ),
+
+            "trigger": (
+                f"رفض سعري وتأكيد هابط أسفل {fmt(r1)}."
+                if r1
+                else
+                "تأكيد هابط من منطقة مقاومة واضحة."
+            ),
+
+            "targets": [
+                s1,
+                s2
+            ],
+
+            "stop": r1,
+            "factors": sell_factors,
+        }
+
+        alternative = {
+            "title": "السيناريو البديل — استعادة الاتجاه الصاعد",
+            "quality": buy_score,
+
+            "mechanism": (
+                f"يتحول الميزان إذا اخترق السعر {fmt(r1)} "
+                f"وثبت فوقه مع تحسن الهيكل والزخم."
+            ),
+
+            "trigger": (
+                f"إغلاق فوق {fmt(r1)} ثم تثبيت المستوى."
+                if r1
+                else
+                "اختراق قمة مهمة والثبات فوقها."
+            ),
+
+            "targets": [
+                r2
+            ],
+
+            "stop": s1,
+            "factors": buy_factors,
+        }
+
     else:
-        primary = {"title": "سيناريو الانتظار — لا أفضلية اتجاهية كافية", "quality": max(buy_score, sell_score),
-                   "mechanism": "الفريمات المحددة لا تمنح أفضلية واضحة؛ القرار يعتمد على كسر أحد طرفي النطاق مع تأكيد.",
-                   "trigger": f"كسر {fmt(r1)} صعوداً أو {fmt(s1)} هبوطاً مع تثبيت السعر.",
-                   "targets": [r1, r2], "stop": None, "factors": []}
-        alternative = {"title": "السيناريو البديل — استمرار التذبذب", "quality": max(buy_score, sell_score),
-                       "mechanism": f"قد يبقى الذهب داخل النطاق بين {fmt(s1)} و{fmt(r1)} حتى يظهر محفز أقوى.",
-                       "trigger": "توسع واضح في الزخم والحجم ثم كسر النطاق.",
-                       "targets": [s1, r1], "stop": None, "factors": []}
-    return primary, alternative, buy_score, sell_score
+
+        primary = {
+            "title": "سيناريو الانتظار — لا أفضلية اتجاهية كافية",
+            "quality": max(
+                buy_score,
+                sell_score
+            ),
+
+            "mechanism": (
+                "الفريمات المحددة لا تمنح أفضلية واضحة؛ "
+                "القرار يعتمد على كسر أحد طرفي النطاق مع تأكيد."
+            ),
+
+            "trigger": (
+                f"كسر {fmt(r1)} صعوداً "
+                f"أو {fmt(s1)} هبوطاً مع تثبيت السعر."
+            ),
+
+            "targets": [
+                r1,
+                r2
+            ],
+
+            "stop": None,
+            "factors": [],
+        }
+
+        alternative = {
+            "title": "السيناريو البديل — استمرار التذبذب",
+            "quality": max(
+                buy_score,
+                sell_score
+            ),
+
+            "mechanism": (
+                f"قد يبقى الذهب داخل النطاق "
+                f"بين {fmt(s1)} و{fmt(r1)} "
+                "حتى يظهر محفز أقوى."
+            ),
+
+            "trigger": (
+                "توسع واضح في الزخم والحجم "
+                "ثم كسر النطاق."
+            ),
+
+            "targets": [
+                s1,
+                r1
+            ],
+
+            "stop": None,
+            "factors": [],
+        }
+
+    return (
+        primary,
+        alternative,
+        buy_score,
+        sell_score
+            )
 
 
 def _format_explanatory_report(frames_data, levels, price, primary, alternative, horizon, extra_lines):
