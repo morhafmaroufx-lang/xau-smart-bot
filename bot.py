@@ -20,6 +20,7 @@ import time
 import logging
 import json
 import sqlite3
+from functools import wraps
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -28,14 +29,14 @@ import pandas as pd
 import numpy as np
 
 from flask import Flask, request, jsonify
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, CallbackQueryHandler, filters
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 
 # ============================================================
 # الإعدادات
 # ============================================================
 
-VERSION = "v18.0"
+VERSION = "v18.4"
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 PORT = int(os.environ.get("PORT", "10000"))
 
@@ -71,154 +72,45 @@ NEWS_FILTER_ENABLED = os.environ.get("NEWS_FILTER_ENABLED", "true").lower() == "
 NEWS_BEFORE_MIN = 30
 NEWS_AFTER_MIN = 30
 NEWS_CACHE_SECONDS = 300
+
 # ============================================================
-# 💳 نظام الاشتراكات - الباقات والأسعار
+# الاشتراكات والصلاحيات
 # ============================================================
+SUBSCRIPTION_DB_PATH = os.environ.get("SUBSCRIPTION_DB_PATH", "subscriptions.db")
+ADMIN_IDS = {int(x.strip()) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
+ADMIN_CONTACT = os.environ.get("ADMIN_CONTACT", "").strip()
 
 PLANS = {
     "FREE": {
-        "name": "🆓 FREE",
-        "price": 0,
-        "trade_limit": 1,
-        "trade_period_days": 7,
+        "name": "🆓 FREE", "price": 0, "trade_limit": 1, "trade_period": "weekly",
+        "features": {"gold_price", "markets", "status", "quick_analysis", "trade_access"}
     },
-
     "BASIC": {
-        "name": "🥉 BASIC",
-        "price": 10,
-        "trade_limit": 5,
-        "trade_period_days": 30,
+        "name": "🥉 BASIC", "price": 10, "trade_limit": 5, "trade_period": "monthly",
+        "features": {"gold_price", "markets", "status", "quick_analysis", "daily_analysis", "weekly_analysis", "sr", "daily_report", "trade_access"}
     },
-
     "PRO": {
-        "name": "🥈 PRO",
-        "price": 20,
-        "trade_limit": 20,
-        "trade_period_days": 30,
+        "name": "🥈 PRO", "price": 20, "trade_limit": 20, "trade_period": "monthly",
+        "features": {"gold_price", "markets", "status", "quick_analysis", "daily_analysis", "weekly_analysis", "sr", "daily_report", "weekly_report", "full_analysis", "trade_now", "trade_alerts", "trade_access", "trade_history"}
     },
-
     "PREMIUM": {
-        "name": "🥇 PREMIUM",
-        "price": 35,
-        "trade_limit": 50,
-        "trade_period_days": 30,
+        "name": "🥇 PREMIUM", "price": 35, "trade_limit": 50, "trade_period": "monthly",
+        "features": {"gold_price", "markets", "status", "quick_analysis", "daily_analysis", "weekly_analysis", "sr", "daily_report", "weekly_report", "full_analysis", "trade_now", "trade_alerts", "trade_access", "trade_history", "institutional", "news_alerts", "market_alerts"}
     },
-
     "VIP": {
-        "name": "💎 VIP",
-        "price": 50,
-        "trade_limit": None,
-        "trade_period_days": 30,
+        "name": "💎 VIP", "price": 50, "trade_limit": None, "trade_period": "monthly",
+        "features": {"gold_price", "markets", "status", "quick_analysis", "daily_analysis", "weekly_analysis", "sr", "daily_report", "weekly_report", "full_analysis", "trade_now", "trade_alerts", "trade_access", "trade_history", "institutional", "news_alerts", "market_alerts", "vip"}
     },
 }
 
-# الحد الأقصى للصفقات حسب الباقة
-TRADE_LIMITS = {
-    "FREE": 1,
-    "BASIC": 5,
-    "PRO": 20,
-    "PREMIUM": 50,
-    "VIP": None,
+TRADE_LIMIT_TEXT = {
+    "FREE": "صفقة تجريبية واحدة كل 7 أيام",
+    "BASIC": "5 صفقات شهرياً",
+    "PRO": "20 صفقة شهرياً",
+    "PREMIUM": "50 صفقة شهرياً",
+    "VIP": "♾️ صفقات غير محدودة",
 }
-# ============================================================
-# 💳 قاعدة بيانات المستخدمين والاشتراكات
-# ============================================================
 
-SUBSCRIPTION_DB = "subscriptions.db"
-
-
-def init_subscription_db():
-    conn = sqlite3.connect(SUBSCRIPTION_DB)
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS subscribers (
-            chat_id INTEGER PRIMARY KEY,
-            username TEXT,
-            first_name TEXT,
-            plan TEXT NOT NULL DEFAULT 'FREE',
-            status TEXT NOT NULL DEFAULT 'active',
-            start_date TEXT,
-            expiry_date TEXT,
-            trades_used INTEGER DEFAULT 0,
-            referral_code TEXT,
-            referred_by INTEGER
-        )
-    """)
-
-    conn.commit()
-    conn.close()
-
-
-def get_subscription(chat_id):
-    conn = sqlite3.connect(SUBSCRIPTION_DB)
-    conn.row_factory = sqlite3.Row
-
-    row = conn.execute(
-        "SELECT * FROM subscribers WHERE chat_id = ?",
-        (chat_id,)
-    ).fetchone()
-
-    conn.close()
-    return row
-
-
-def create_free_user(chat_id, username=None, first_name=None):
-    if get_subscription(chat_id):
-        return
-
-    conn = sqlite3.connect(SUBSCRIPTION_DB)
-
-    conn.execute("""
-        INSERT INTO subscribers (
-            chat_id,
-            username,
-            first_name,
-            plan,
-            status,
-            start_date,
-            trades_used,
-            referral_code
-        )
-        VALUES (?, ?, ?, 'FREE', 'active', ?, 0, ?)
-    """, (
-        chat_id,
-        username,
-        first_name,
-        datetime.now().isoformat(),
-        f"REF{chat_id}"
-    ))
-
-    conn.commit()
-    conn.close()
-
-
-def get_user_plan(chat_id):
-    user = get_subscription(chat_id)
-
-    if not user:
-        return "FREE"
-
-    return user["plan"]
-
-
-def is_subscription_active(chat_id):
-    user = get_subscription(chat_id)
-
-    if not user:
-        return True
-
-    if user["plan"] == "FREE":
-        return True
-
-    if not user["expiry_date"]:
-        return False
-
-    try:
-        expiry = datetime.fromisoformat(user["expiry_date"])
-        return datetime.now() < expiry
-    except Exception:
-        return False
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
@@ -236,6 +128,182 @@ NEWS_CACHE = {"time": 0, "events": []}
 TRADE_HISTORY = []
 LAST_ANALYSIS = None
 MAX_TRADE_HISTORY = 500
+
+# ============================================================
+# محرك الاشتراكات
+# ============================================================
+
+def _db():
+    conn = sqlite3.connect(SUBSCRIPTION_DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    conn.execute("""CREATE TABLE IF NOT EXISTS users (
+        chat_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, plan TEXT NOT NULL DEFAULT 'FREE',
+        status TEXT NOT NULL DEFAULT 'active', start_date TEXT, expiry_date TEXT, referral_code TEXT UNIQUE, referred_by INTEGER,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS usage (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, feature TEXT NOT NULL, used_at TEXT NOT NULL,
+        UNIQUE(chat_id, feature, used_at)
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS subscription_requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, plan TEXT NOT NULL,
+        requested_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'PENDING'
+    )""")
+    conn.commit()
+    return conn
+
+
+def _ensure_user(update):
+    chat = update.effective_chat
+    user = update.effective_user
+    now = now_damascus().isoformat()
+    code = f"ref_{chat.id}"
+    conn = _db()
+    try:
+        row = conn.execute("SELECT * FROM users WHERE chat_id=?", (chat.id,)).fetchone()
+        if not row:
+            conn.execute("INSERT OR IGNORE INTO users(chat_id, username, first_name, plan, status, referral_code, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                         (chat.id, getattr(user, 'username', None), getattr(user, 'first_name', None), 'FREE', 'active', code, now, now))
+            conn.commit()
+        else:
+            conn.execute("UPDATE users SET username=?, first_name=?, updated_at=? WHERE chat_id=?",
+                         (getattr(user, 'username', None), getattr(user, 'first_name', None), now, chat.id))
+            conn.commit()
+        return conn.execute("SELECT * FROM users WHERE chat_id=?", (chat.id,)).fetchone()
+    finally:
+        conn.close()
+
+
+def get_member(chat_id):
+    conn = _db()
+    try:
+        row = conn.execute("SELECT * FROM users WHERE chat_id=?", (chat_id,)).fetchone()
+        if not row:
+            return None
+        if row['expiry_date']:
+            try:
+                expiry = datetime.fromisoformat(row['expiry_date'])
+                if expiry.tzinfo is None:
+                    expiry = expiry.replace(tzinfo=DAMASCUS)
+                if now_damascus() >= expiry and row['plan'] != 'FREE':
+                    conn.execute("UPDATE users SET plan='FREE', status='expired', updated_at=? WHERE chat_id=?", (now_damascus().isoformat(), chat_id))
+                    conn.commit()
+                    row = conn.execute("SELECT * FROM users WHERE chat_id=?", (chat_id,)).fetchone()
+            except Exception:
+                pass
+        return row
+    finally:
+        conn.close()
+
+
+def has_feature(chat_id, feature):
+    row = get_member(chat_id)
+    plan = row['plan'] if row else 'FREE'
+    return feature in PLANS.get(plan, PLANS['FREE'])['features']
+
+
+def usage_count(chat_id, plan=None):
+    row = get_member(chat_id)
+    plan = plan or (row['plan'] if row else 'FREE')
+    if plan == 'VIP':
+        return 0
+    period_start = now_damascus() - timedelta(days=7 if PLANS[plan]['trade_period'] == 'weekly' else 30)
+    conn = _db()
+    try:
+        return conn.execute("SELECT COUNT(*) FROM usage WHERE chat_id=? AND feature='trade' AND used_at>=?", (chat_id, period_start.isoformat())).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def trade_quota(chat_id):
+    row = get_member(chat_id)
+    plan = row['plan'] if row else 'FREE'
+    limit = PLANS[plan]['trade_limit']
+    used = usage_count(chat_id, plan)
+    return plan, used, limit
+
+
+def can_receive_trade(chat_id):
+    plan, used, limit = trade_quota(chat_id)
+    return limit is None or used < limit
+
+
+def consume_trade(chat_id):
+    if not can_receive_trade(chat_id):
+        return False
+    conn = _db()
+    try:
+        conn.execute("INSERT INTO usage(chat_id, feature, used_at) VALUES(?,?,?)", (chat_id, 'trade', now_damascus().isoformat()))
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def alert_subscribers():
+    """إرجاع جميع المستخدمين ذوي الباقات التي تتضمن تنبيهات الصفقات."""
+    conn = _db()
+    try:
+        rows = conn.execute("SELECT chat_id FROM users WHERE status='active' AND plan IN ('PRO','PREMIUM','VIP')").fetchall()
+        result = set()
+        for row in rows:
+            chat_id = int(row["chat_id"])
+            if has_feature(chat_id, "trade_alerts"):
+                result.add(chat_id)
+        return result
+    finally:
+        conn.close()
+
+
+def plan_status_text(chat_id):
+    row = get_member(chat_id)
+    plan = row['plan'] if row else 'FREE'
+    info = PLANS.get(plan, PLANS['FREE'])
+    if plan == 'VIP':
+        quota = "♾️ غير محدودة"
+    else:
+        used = usage_count(chat_id, plan)
+        quota = f"{max(0, info['trade_limit'] - used)} متبقية"
+    expiry = row['expiry_date'] if row and row['expiry_date'] else "لا يوجد انتهاء — مجاني"
+    return f"{info['name']} | ${info['price']} / شهر\n🎯 الصفقات: {TRADE_LIMIT_TEXT[plan]}\n📊 المتبقي: {quota}\n📅 الانتهاء: {expiry}"
+
+
+def plans_text():
+    lines = ["💳 باقات XAU SMART TRADER", "━━━━━━━━━━━━━━━━━━"]
+    for key in ("FREE", "BASIC", "PRO", "PREMIUM", "VIP"):
+        p = PLANS[key]
+        lines += [f"{p['name']} — ${p['price']} / شهر", f"🎯 الصفقات: {TRADE_LIMIT_TEXT[key]}"]
+        if key == 'FREE':
+            lines.append("🎁 لتجربة النظام قبل الترقية")
+        lines.append("")
+    lines += ["🚀 كلما ارتفعت الباقة زاد وصولك إلى الإشارات والتحليلات والتنبيهات.", "💡 نظام الصفقات يمنح كل باقة تجربة حقيقية مع حدود متفاوتة."]
+    return "\n".join(lines)
+
+
+def feature_guard(feature, upgrade_text=True):
+    async def checker(update, context):
+        _ensure_user(update)
+        chat_id = update.effective_chat.id
+        if has_feature(chat_id, feature):
+            return True
+        if upgrade_text:
+            await reply(update, f"🔒 هذه الميزة غير متاحة ضمن باقتك الحالية.\n\n💳 استخدم /plans لرؤية الباقات والترقية.")
+        return False
+    return checker
+
+
+def _format_trade_message(result, title="🚨 إشارة ذهب"):
+    trade = result['trade']
+    direction = "🟢 شراء" if result['direction'] == "BUY" else "🔴 بيع"
+    quality = "🔥 قوية" if result['score'] >= STRONG_THRESHOLD else "🎯 مؤهلة"
+    return (f"{title}\n━━━━━━━━━━━━━━━━━━\n\n"
+            f"📈 الصفقة: {direction}\n💪 الجودة: {result['score']} نقطة — {quality}\n\n"
+            f"💰 السعر: {result['price']:.2f}\n📍 الدخول: {trade['entry']:.2f}\n"
+            f"🛑 SL: {trade['sl']:.2f}\n🎯 TP1: {trade['tp1']:.2f}\n🎯 TP2: {trade['tp2']:.2f}\n"
+            f"⚖️ R:R: 1:{trade['rr']:.2f}\n\n🧠 التلاقي:\n" +
+            "\n".join("• " + x for x in result['factors'][:7]) +
+            "\n\n⚠️ إشارة تحليلية للتنفيذ اليدوي.")
+
 
 # ============================================================
 # Flask
@@ -537,161 +605,51 @@ def find_fvg(df):
 
 
 def support_resistance(df, lookback=120):
-    """
-    بناء دعم ومقاومة عملية ومرتبة حسب السعر الحالي.
-
-    القواعد:
-    - الدعم يجب أن يكون تحت السعر الحالي.
-    - المقاومة يجب أن تكون فوق السعر الحالي.
-    - S1/R1 الأقرب للسعر.
-    - S2/R2 المستوى التالي.
-    - S3/R3 المستوى الأبعد.
-    - التجميع يتم باستخدام ATR.
-    - لا يتم إدخال مستوى من الجهة الخاطئة.
-    """
-
-    x = df.tail(min(lookback, len(df))).copy()
-
-    if len(x) < 10:
-        return {
-            "support1": None,
-            "support2": None,
-            "support3": None,
-            "resistance1": None,
-            "resistance2": None,
-            "resistance3": None,
-            "atr": 0.0
-        }
-
+    x = df.tail(min(lookback, len(df)))
     current = sf(x["close"].iloc[-1])
-    atr = max(sf(ATR(x).iloc[-1], 1), 0.01)
-
-    # مسافة تجميع المناطق حسب ATR
+    atr = sf(ATR(x).iloc[-1], 1)
     radius = max(atr * 0.35, current * 0.00035)
+    supports, resistances = [], []
 
-    supports = []
-    resistances = []
-
-    # ------------------------------------------------------------
-    # استخراج القمم والقيعان
-    # ------------------------------------------------------------
     for i in range(2, len(x) - 2):
-
-        low = sf(x["low"].iloc[i])
-        high = sf(x["high"].iloc[i])
-
+        low, high = sf(x["low"].iloc[i]), sf(x["high"].iloc[i])
         left_low = sf(x["low"].iloc[i-2:i].min())
         right_low = sf(x["low"].iloc[i+1:i+3].min())
-
         left_high = sf(x["high"].iloc[i-2:i].max())
         right_high = sf(x["high"].iloc[i+1:i+3].max())
-
-        # قاع واضح + أسفل السعر الحالي = دعم
         if low <= left_low and low <= right_low and low < current:
             supports.append(low)
-
-        # قمة واضحة + فوق السعر الحالي = مقاومة
         if high >= left_high and high >= right_high and high > current:
             resistances.append(high)
 
-    # ------------------------------------------------------------
-    # تجميع المستويات المتقاربة
-    # ------------------------------------------------------------
     def cluster(values):
-
-        if not values:
-            return []
-
         values = sorted(values)
         groups = []
-
         for price in values:
-
             if not groups:
                 groups.append([price])
                 continue
-
             center = sum(groups[-1]) / len(groups[-1])
-
             if abs(price - center) <= radius:
                 groups[-1].append(price)
             else:
                 groups.append([price])
-
         zones = []
-
         for group in groups:
-
             center = sum(group) / len(group)
-
-            # قوة المنطقة تعتمد على عدد اللمسات
             strength = min(100, 40 + len(group) * 15)
-
-            zones.append({
-                "price": center,
-                "strength": strength,
-                "touches": len(group)
-            })
-
+            zones.append({"price": center, "strength": strength, "touches": len(group)})
         return zones
 
-    support_zones = cluster(supports)
-    resistance_zones = cluster(resistances)
-
-    # ------------------------------------------------------------
-    # فلترة صارمة حسب موقع السعر
-    # ------------------------------------------------------------
-
-    support_zones = [
-        z for z in support_zones
-        if z["price"] < current
-    ]
-
-    resistance_zones = [
-        z for z in resistance_zones
-        if z["price"] > current
-    ]
-
-    # ------------------------------------------------------------
-    # ترتيب الدعم:
-    # S1 الأقرب
-    # S2 التالي
-    # S3 الأبعد
-    # ------------------------------------------------------------
-
-    support_zones = sorted(
-        support_zones,
-        key=lambda z: current - z["price"]
-    )
-
-    # ------------------------------------------------------------
-    # ترتيب المقاومة:
-    # R1 الأقرب
-    # R2 التالي
-    # R3 الأبعد
-    # ------------------------------------------------------------
-
-    resistance_zones = sorted(
-        resistance_zones,
-        key=lambda z: z["price"] - current
-    )
-
-    # ------------------------------------------------------------
-    # أخذ أول 3 مستويات فقط
-    # ------------------------------------------------------------
-
-    s = support_zones[:3]
-    r = resistance_zones[:3]
-
+    s = sorted(cluster(supports), key=lambda z: abs(current - z["price"]))[:3]
+    r = sorted(cluster(resistances), key=lambda z: abs(current - z["price"]))[:3]
     return {
         "support1": s[0] if len(s) > 0 else None,
         "support2": s[1] if len(s) > 1 else None,
         "support3": s[2] if len(s) > 2 else None,
-
         "resistance1": r[0] if len(r) > 0 else None,
         "resistance2": r[1] if len(r) > 1 else None,
         "resistance3": r[2] if len(r) > 2 else None,
-
         "atr": atr
     }
 
@@ -905,330 +863,52 @@ def scenario_quality(mtf, direction, levels, price, preferred=True):
 
 
 def build_trade(direction, h1, m15, levels):
+    """بناء أهداف عملية: TP1 قريب وقابل للتحقق، وTP2 ممتد باعتدال.
+    مستويات S/R تستخدم فقط عندما تكون ضمن نطاق منطقي؛ لا نطارد مقاومة/دعماً بعيداً.
     """
-    بناء صفقة عملية:
-    - لا تعتمد الصفقة على وجود S/R حتى يتم إصدارها.
-    - TP1 قريب وقابل للتحقق.
-    - TP2 ممتد باعتدال.
-    - استخدام S/R فقط إذا كان المستوى قريباً ومنطقياً.
-    - عند غياب S/R يتم استخدام ATR كبديل.
-    """
-
     price = m15["price"]
     atr = max(m15["atr"], 0.50)
-
-    s1 = levels.get("support1")
-    s2 = levels.get("support2")
-
-    r1 = levels.get("resistance1")
-    r2 = levels.get("resistance2")
+    s1, s2 = levels.get("support1"), levels.get("support2")
+    r1, r2 = levels.get("resistance1"), levels.get("resistance2")
+    max_tp1 = atr * 1.35
+    max_tp2 = atr * 2.10
 
     if direction == "BUY":
-
         entry = price
-
-        # SL يعتمد على أقرب دعم إن كان قريباً
-        if (
-            s1
-            and s1["price"] < entry
-            and entry - s1["price"] <= atr * 1.10
-        ):
-            sl = s1["price"] - atr * 0.15
-        else:
-            sl = entry - atr * 0.95
-
+        sl = (s1["price"] - atr * 0.15 if s1 and entry - s1["price"] <= atr * 1.10 else entry - atr * 0.95)
         risk = abs(entry - sl)
-
-        # TP1 طبيعي وقريب
-        natural_tp1 = entry + max(
-            atr * 1.10,
-            risk * 1.05
-        )
-
-        # لا نستخدم R1 إذا كان بعيداً
-        if (
-            r1
-            and r1["price"] > entry
-            and r1["price"] - entry <= atr * 1.35
-        ):
+        natural_tp1 = entry + max(atr * 1.10, risk * 1.05)
+        if r1 and entry < r1["price"] <= entry + max_tp1:
             tp1 = r1["price"]
         else:
             tp1 = natural_tp1
-
-        # TP2
-        natural_tp2 = entry + max(
-            atr * 1.75,
-            risk * 1.55
-        )
-
-        if (
-            r2
-            and r2["price"] > tp1
-            and r2["price"] - entry <= atr * 2.10
-        ):
+        natural_tp2 = entry + max(atr * 1.75, risk * 1.55)
+        if r2 and tp1 < r2["price"] <= entry + max_tp2:
             tp2 = r2["price"]
         else:
             tp2 = natural_tp2
-
-
-        def build_trade(direction, h1, m15, levels):
-    """
-    بناء صفقة عملية وقابلة للتنفيذ.
-
-    القواعد:
-    - لا نعتمد على S/R إذا كان بعيداً عن السعر.
-    - TP1 قريب وواقعي.
-    - TP2 ممتد باعتدال.
-    - غياب S/R لا يمنع إنشاء الصفقة.
-    - لا علاقة لهذه الدالة بحد الإشارة؛ قرار التأهل يبقى كما هو.
-    """
-
-    price = float(m15["price"])
-    atr = max(float(m15["atr"]), 0.50)
-
-    s1 = levels.get("support1")
-    s2 = levels.get("support2")
-    r1 = levels.get("resistance1")
-    r2 = levels.get("resistance2")
-
-    # =========================================================
-    # حدود المسافات المسموح بها للأهداف
-    # =========================================================
-    tp1_max_distance = atr * 1.50
-    tp2_max_distance = atr * 2.40
-
-    # =========================================================
-    # BUY
-    # =========================================================
-    if direction == "BUY":
-
-        entry = price
-
-        # SL يعتمد على الدعم القريب إن كان منطقياً
-        if s1 and entry > s1["price"]:
-            support_distance = entry - s1["price"]
-
-            if support_distance <= atr * 1.20:
-                sl = s1["price"] - atr * 0.15
-            else:
-                sl = entry - atr * 1.00
-        else:
-            sl = entry - atr * 1.00
-
-        risk = abs(entry - sl)
-
-        # -----------------------------------------------------
-        # TP1
-        # -----------------------------------------------------
-        tp1 = None
-
-        if r1 and r1["price"] > entry:
-            r1_distance = r1["price"] - entry
-
-            if r1_distance <= tp1_max_distance:
-                tp1 = r1["price"]
-
-        # إذا لم يوجد R1 مناسب → هدف ATR
-        if tp1 is None:
-            tp1 = entry + max(atr * 1.10, risk * 1.05)
-
-        # -----------------------------------------------------
-        # TP2
-        # -----------------------------------------------------
-        tp2 = None
-
-        if r2 and r2["price"] > tp1:
-            r2_distance = r2["price"] - entry
-
-            if r2_distance <= tp2_max_distance:
-                tp2 = r2["price"]
-
-        # إذا لم يوجد R2 مناسب → هدف ATR منطقي
-        if tp2 is None:
-            tp2 = entry + max(atr * 1.75, risk * 1.50)
-
-        # ضمان أن TP2 أكبر من TP1
-        if tp2 <= tp1:
-            tp2 = tp1 + atr * 0.50
-
-    # =========================================================
-    # SELL
-    # =========================================================
     elif direction == "SELL":
-
         entry = price
-
-        # SL يعتمد على المقاومة القريبة إن كانت منطقية
-        if r1 and r1["price"] > entry:
-            resistance_distance = r1["price"] - entry
-
-            if resistance_distance <= atr * 1.20:
-                sl = r1["price"] + atr * 0.15
-            else:
-                sl = entry + atr * 1.00
-        else:
-            sl = entry + atr * 1.00
-
+        sl = (r1["price"] + atr * 0.15 if r1 and r1["price"] - entry <= atr * 1.10 else entry + atr * 0.95)
         risk = abs(entry - sl)
-
-        # -----------------------------------------------------
-        # TP1
-        # -----------------------------------------------------
-        tp1 = None
-
-        if s1 and s1["price"] < entry:
-            s1_distance = entry - s1["price"]
-
-            if s1_distance <= tp1_max_distance:
-                tp1 = s1["price"]
-
-        # إذا لم يوجد S1 مناسب → هدف ATR
-        if tp1 is None:
-            tp1 = entry - max(atr * 1.10, risk * 1.05)
-
-        # -----------------------------------------------------
-        # TP2
-        # -----------------------------------------------------
-        tp2 = None
-
-        if s2 and s2["price"] < tp1:
-            s2_distance = entry - s2["price"]
-
-            if s2_distance <= tp2_max_distance:
-                tp2 = s2["price"]
-
-        # إذا لم يوجد S2 مناسب → هدف ATR منطقي
-        if tp2 is None:
-            tp2 = entry - max(atr * 1.75, risk * 1.50)
-
-        # ضمان أن TP2 أقل من TP1
-        if tp2 >= tp1:
-            tp2 = tp1 - atr * 0.50
-
-    else:
-        return None
-
-    # =========================================================
-    # الحساب النهائي
-    # =========================================================
-    risk = abs(entry - sl)
-    reward = abs(tp2 - entry)
-
-    rr = reward / risk if risk > 0 else 0
-
-    return {
-        "entry": round(entry, 2),
-        "sl": round(sl, 2),
-        "tp1": round(tp1, 2),
-        "tp2": round(tp2, 2),
-        "rr": round(rr, 2)
-        }
-
-    # ------------------------------------------------------------
-    # التأكد من منطقية الأهداف
-    # ------------------------------------------------------------
-
-    risk = abs(entry - sl)
-    reward = abs(tp2 - entry)
-
-    rr = reward / risk if risk > 0 else 0
-
-    return {
-        "entry": entry,
-        "sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
-        "rr": rr,
-        }
-
-    # ------------------------------------------------------------
-    # BUY
-    # ------------------------------------------------------------
-    if direction == "BUY":
-
-        entry = price
-
-        # وقف منطقي بدون الاعتماد الإجباري على S1
-        if s1_price is not None and 0 < entry - s1_price <= atr * 1.10:
-            sl = s1_price - atr * 0.15
-        else:
-            sl = entry - atr * 0.95
-
-        risk = abs(entry - sl)
-
-        # أهداف ATR عملية وأقرب من الإصدار السابق
-        natural_tp1 = entry + max(atr * 1.10, risk * 1.05)
-        natural_tp2 = entry + max(atr * 1.60, risk * 1.50)
-
-        # TP1: استخدم المقاومة القريبة فقط إذا كانت منطقية
-        if r1_price is not None and entry < r1_price <= entry + atr * 1.35:
-            tp1 = r1_price
-        else:
-            tp1 = natural_tp1
-
-        # TP2: استخدم المقاومة التالية إذا كانت منطقية
-        if r2_price is not None and tp1 < r2_price <= entry + atr * 2.00:
-            tp2 = r2_price
-        else:
-            tp2 = natural_tp2
-
-        # ضمان أن TP2 أبعد من TP1
-        if tp2 <= tp1:
-            tp2 = max(natural_tp2, tp1 + atr * 0.35)
-
-    # ------------------------------------------------------------
-    # SELL
-    # ------------------------------------------------------------
-    elif direction == "SELL":
-
-        entry = price
-
-        # وقف منطقي بدون الاعتماد الإجباري على R1
-        if r1_price is not None and 0 < r1_price - entry <= atr * 1.10:
-            sl = r1_price + atr * 0.15
-        else:
-            sl = entry + atr * 0.95
-
-        risk = abs(entry - sl)
-
-        # أهداف ATR عملية وأقرب من الإصدار السابق
         natural_tp1 = entry - max(atr * 1.10, risk * 1.05)
-        natural_tp2 = entry - max(atr * 1.60, risk * 1.50)
-
-        # TP1: استخدم الدعم القريب فقط إذا كان منطقيًا
-        if s1_price is not None and entry > s1_price >= entry - atr * 1.35:
-            tp1 = s1_price
+        if s1 and entry > s1["price"] >= entry - max_tp1:
+            tp1 = s1["price"]
         else:
             tp1 = natural_tp1
-
-        # TP2: استخدم الدعم التالي إذا كان منطقيًا
-        if s2_price is not None and tp1 > s2_price >= entry - atr * 2.00:
-            tp2 = s2_price
+        natural_tp2 = entry - max(atr * 1.75, risk * 1.55)
+        if s2 and tp1 > s2["price"] >= entry - max_tp2:
+            tp2 = s2["price"]
         else:
             tp2 = natural_tp2
-
-        # ضمان أن TP2 أبعد من TP1
-        if tp2 >= tp1:
-            tp2 = min(natural_tp2, tp1 - atr * 0.35)
-
     else:
         return None
 
-    # ------------------------------------------------------------
-    # حساب R:R
-    # ------------------------------------------------------------
     risk = abs(entry - sl)
     reward = abs(tp2 - entry)
-
     rr = reward / risk if risk > 0 else 0
+    return {"entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "rr": rr}
 
-    return {
-        "entry": round(entry, 2),
-        "sl": round(sl, 2),
-        "tp1": round(tp1, 2),
-        "tp2": round(tp2, 2),
-        "rr": round(rr, 2),
-    }
 # ============================================================
 # الأخبار
 # ============================================================
@@ -1298,7 +978,8 @@ def evaluate_signal():
     news_blocked,news_text=news_filter()
     valid=direction in ("BUY","SELL") and final_score>=MIN_TRADE_SCORE and not news_blocked
     trade=build_trade(direction,h1,m15,levels) if valid else None
-    if trade and trade["rr"]<1.00: valid=False; factors.append("R:R غير مناسب")
+    if trade and trade["rr"]<1.20:
+        valid=False; factors.append("R:R أقل من 1:1.20")
     result={"signal":valid,"direction":direction,"score":final_score,"quality":quality,"quality_icon":quality_icon,"price":price,"levels":levels,"news_blocked":news_blocked,"news":news_text,"factors":factors,"trade":trade,"mtf":mtf,"institutional":institutional}
     LAST_ANALYSIS=result; return result
 
@@ -1346,7 +1027,7 @@ def frame_text(name, x):
     )
 
 
-def build_analysis():
+def build_analysis(include_trade=True):
     result = evaluate_signal()
     mtf = result["mtf"]
     direction = {"BUY": "🟢 أفضلية شراء", "SELL": "🔴 أفضلية بيع", "WAIT": "🟡 حياد"}.get(result["direction"], "🟡 حياد")
@@ -1377,7 +1058,7 @@ def build_analysis():
         f"📰 الأخبار: {result['news']}", "", "🔎 عوامل التلاقي:"
     ]
     lines.extend(["• " + x for x in result["factors"]] or ["• لا يوجد تلاقي إضافي مسجل حالياً."])
-    if result["signal"] and result["trade"]:
+    if include_trade and result["signal"] and result["trade"]:
         t = result["trade"]
         d = "🟢 شراء" if result["direction"] == "BUY" else "🔴 بيع"
         quality = "🔥 قوية" if result["score"] >= STRONG_THRESHOLD else "🎯 مؤهلة"
@@ -1439,211 +1120,51 @@ def _scenario_score(frames_data, frames, direction, levels, price, atr):
 
 
 def _make_scenarios(frames_data, levels, price, atr, horizon):
-
     if horizon == "weekly":
-        frame_defs = [
-            ("W1", 30),
-            ("D1", 25),
-            ("H4", 20),
-        ]
+        frame_defs = [("W1", 30), ("D1", 25), ("H4", 20)]
     else:
-        frame_defs = [
-            ("H1", 30),
-            ("M15", 25),
-            ("M5", 20),
-        ]
+        frame_defs = [("H1", 30), ("M15", 25), ("M5", 20)]
 
     def score(direction):
-        return _scenario_score(
-            frames_data,
-            frame_defs,
-            direction,
-            levels,
-            price,
-            atr
-        )
+        return _scenario_score(frames_data, frame_defs, direction, levels, price, atr)
 
     buy_score, buy_factors = score("BUY")
     sell_score, sell_factors = score("SELL")
+    direction = "BUY" if buy_score > sell_score else "SELL" if sell_score > buy_score else "WAIT"
 
-    direction = (
-        "BUY"
-        if buy_score > sell_score
-        else "SELL"
-        if sell_score > buy_score
-        else "WAIT"
-    )
-
-    # المستويات أصبحت مضمونة الاتجاه:
-    # دعم تحت السعر / مقاومة فوق السعر
     s1 = nearest_support(levels, price)
     s2 = next_support(levels, price)
-
     r1 = nearest_resistance(levels, price)
     r2 = next_resistance(levels, price)
 
     if direction == "BUY":
-
-        primary = {
-            "title": "استمرار الاتجاه الصاعد / بناء مركز شراء",
-            "quality": buy_score,
-
-            "mechanism": (
-                f"تبقى الرؤية الشرائية مفضلة "
-                f"ما دام السعر يحافظ على الدعم {fmt(s1)} "
-                f"ولا يظهر كسر هيكلي هابط مؤكد."
-            ),
-
-            "trigger": (
-                f"تثبيت السعر فوق {fmt(s1)} "
-                f"مع تأكيد الاتجاه على الفريمات المعنية."
-            ),
-
-            "targets": [
-                r1,
-                r2
-            ],
-
-            "stop": s1,
-            "factors": buy_factors,
-        }
-
-        alternative = {
-            "title": "السيناريو البديل — تحول هابط",
-            "quality": sell_score,
-
-            "mechanism": (
-                f"يتحول الميزان إلى الهبوط "
-                f"عند فقدان الدعم {fmt(s1)} "
-                f"مع تأكيد كسر هيكلي."
-            ),
-
-            "trigger": (
-                f"إغلاق واضح أسفل {fmt(s1)} "
-                f"ثم فشل استعادة المستوى."
-            ),
-
-            "targets": [
-                s2
-            ],
-
-            "stop": r1,
-            "factors": sell_factors,
-        }
-
+        primary = {"title": "استمرار الاتجاه الصاعد / بناء مركز شراء", "quality": buy_score,
+                   "mechanism": f"تبقى الرؤية الشرائية مفضلة ما دام السعر يحافظ على منطقة الدعم {fmt(s1)} ولا يظهر كسر هيكلي هابط مؤكد.",
+                   "trigger": f"تثبيت السعر فوق {fmt(s1)} مع تأكيد الاتجاه على الفريمات المعنية.",
+                   "targets": [r1, r2], "stop": s1, "factors": buy_factors}
+        alternative = {"title": "السيناريو البديل — تحول هابط", "quality": sell_score,
+                       "mechanism": f"يتحول الميزان إلى الهبوط عند فقدان الدعم {fmt(s1)} مع تأكيد كسر هيكلي وليس مجرد ذيل سعري.",
+                       "trigger": f"إغلاق واضح أسفل {fmt(s1)} ثم فشل استعادة المستوى.",
+                       "targets": [s2, None], "stop": r1, "factors": sell_factors}
     elif direction == "SELL":
-
-        primary = {
-            "title": "استمرار الاتجاه الهابط / البيع من المقاومة",
-            "quality": sell_score,
-
-            "mechanism": (
-                f"تبقى الرؤية البيعية مفضلة "
-                f"ما دام السعر أسفل المقاومة {fmt(r1)} "
-                f"والهيكل يدعم الضغط الهابط."
-            ),
-
-            "trigger": (
-                f"رفض سعري وتأكيد هابط أسفل {fmt(r1)}."
-                if r1
-                else
-                "تأكيد هابط من منطقة مقاومة واضحة."
-            ),
-
-            "targets": [
-                s1,
-                s2
-            ],
-
-            "stop": r1,
-            "factors": sell_factors,
-        }
-
-        alternative = {
-            "title": "السيناريو البديل — استعادة الاتجاه الصاعد",
-            "quality": buy_score,
-
-            "mechanism": (
-                f"يتحول الميزان إذا اخترق السعر {fmt(r1)} "
-                f"وثبت فوقه مع تحسن الهيكل والزخم."
-            ),
-
-            "trigger": (
-                f"إغلاق فوق {fmt(r1)} ثم تثبيت المستوى."
-                if r1
-                else
-                "اختراق قمة مهمة والثبات فوقها."
-            ),
-
-            "targets": [
-                r2
-            ],
-
-            "stop": s1,
-            "factors": buy_factors,
-        }
-
+        primary = {"title": "استمرار الاتجاه الهابط / البيع من المقاومة", "quality": sell_score,
+                   "mechanism": f"تبقى الرؤية البيعية مفضلة ما دام السعر أسفل المقاومة {fmt(r1)} والهيكل يدعم الضغط الهابط.",
+                   "trigger": f"رفض سعري وتأكيد هابط أسفل {fmt(r1)}." if r1 else "تأكيد هابط من منطقة مقاومة واضحة.",
+                   "targets": [s1, s2], "stop": r1, "factors": sell_factors}
+        alternative = {"title": "السيناريو البديل — استعادة الاتجاه الصاعد", "quality": buy_score,
+                       "mechanism": f"يتحول الميزان إذا اخترق السعر {fmt(r1)} وثبت فوقه مع تحسن الهيكل والزخم.",
+                       "trigger": f"إغلاق فوق {fmt(r1)} ثم تثبيت المستوى." if r1 else "اختراق قمة مهمة والثبات فوقها.",
+                       "targets": [r2, None], "stop": s1, "factors": buy_factors}
     else:
-
-        primary = {
-            "title": "سيناريو الانتظار — لا أفضلية اتجاهية كافية",
-            "quality": max(
-                buy_score,
-                sell_score
-            ),
-
-            "mechanism": (
-                "الفريمات المحددة لا تمنح أفضلية واضحة؛ "
-                "القرار يعتمد على كسر أحد طرفي النطاق مع تأكيد."
-            ),
-
-            "trigger": (
-                f"كسر {fmt(r1)} صعوداً "
-                f"أو {fmt(s1)} هبوطاً مع تثبيت السعر."
-            ),
-
-            "targets": [
-                r1,
-                r2
-            ],
-
-            "stop": None,
-            "factors": [],
-        }
-
-        alternative = {
-            "title": "السيناريو البديل — استمرار التذبذب",
-            "quality": max(
-                buy_score,
-                sell_score
-            ),
-
-            "mechanism": (
-                f"قد يبقى الذهب داخل النطاق "
-                f"بين {fmt(s1)} و{fmt(r1)} "
-                "حتى يظهر محفز أقوى."
-            ),
-
-            "trigger": (
-                "توسع واضح في الزخم والحجم "
-                "ثم كسر النطاق."
-            ),
-
-            "targets": [
-                s1,
-                r1
-            ],
-
-            "stop": None,
-            "factors": [],
-        }
-
-    return (
-        primary,
-        alternative,
-        buy_score,
-        sell_score
-            )
+        primary = {"title": "سيناريو الانتظار — لا أفضلية اتجاهية كافية", "quality": max(buy_score, sell_score),
+                   "mechanism": "الفريمات المحددة لا تمنح أفضلية واضحة؛ القرار يعتمد على كسر أحد طرفي النطاق مع تأكيد.",
+                   "trigger": f"كسر {fmt(r1)} صعوداً أو {fmt(s1)} هبوطاً مع تثبيت السعر.",
+                   "targets": [r1, r2], "stop": None, "factors": []}
+        alternative = {"title": "السيناريو البديل — استمرار التذبذب", "quality": max(buy_score, sell_score),
+                       "mechanism": f"قد يبقى الذهب داخل النطاق بين {fmt(s1)} و{fmt(r1)} حتى يظهر محفز أقوى.",
+                       "trigger": "توسع واضح في الزخم والحجم ثم كسر النطاق.",
+                       "targets": [s1, r1], "stop": None, "factors": []}
+    return primary, alternative, buy_score, sell_score
 
 
 def _format_explanatory_report(frames_data, levels, price, primary, alternative, horizon, extra_lines):
@@ -1756,20 +1277,7 @@ async def reply(update, text):
 
 
 async def start(update, context):
-    async def start(update, context):
-    # 👤 تسجيل المستخدم تلقائياً في نظام الاشتراكات
-    create_free_user(
-        update.effective_chat.id,
-        update.effective_user.username,
-        update.effective_user.first_name
-    )
-
-
-        keyboard = [
-    ["📊 التحليل الكامل", "📊 التحليل اليومي"],
-    ["⚡ التحليل السريع", "🎯 صفقة الآن"],
-    ["💳 الباقات", "👤 اشتراكي"]
-    ]
+    _ensure_user(update)
     keyboard = [
         ["📊 التحليل الكامل", "📊 التحليل اليومي"],
         ["⚡ التحليل السريع", "🎯 صفقة الآن"],
@@ -1778,6 +1286,7 @@ async def start(update, context):
         ["📅 التحليل الأسبوعي", "📝 التوضيحي اليومي"],
         ["📰 الأخبار", "💰 سعر الذهب"],
         ["🌍 الأسواق", "🔔 التنبيهات"],
+        ["💳 الباقات", "👤 اشتراكي"] ,
         ["🟢 حالة النظام"]
     ]
     text = (
@@ -1787,19 +1296,22 @@ async def start(update, context):
         "Structure + Momentum + Volume + Fibonacci + FVG\n\n"
         f"🎯 حد الإشارة: {SIGNAL_THRESHOLD} نقطة\n"
         "📝 تمت إضافة التقرير التوضيحي اليومي والأسبوعي.\n\n"
+        "💳 الاشتراكات: استخدم /plans\n"
         "اختر العملية 👇"
     )
     await update.message.reply_text(text, reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
 
 
 async def full_analysis(update, context):
+    if not await feature_guard("full_analysis")(update, context): return
     try:
-        await reply(update, await asyncio.to_thread(build_analysis))
+        await reply(update, await asyncio.to_thread(build_analysis, can_receive_trade(update.effective_chat.id)))
     except Exception as e:
         await reply(update, f"❌ تعذر تنفيذ التحليل.\nالسبب: {e}")
 
 
 async def quick_analysis(update, context):
+    if not await feature_guard("quick_analysis")(update, context): return
     try:
         m15 = analyze(get_bars("15m", 200))
         price = live_price()
@@ -1817,6 +1329,10 @@ async def quick_analysis(update, context):
 
 
 async def trade_now(update, context):
+    if not await feature_guard("trade_now")(update, context): return
+    if not can_receive_trade(update.effective_chat.id):
+        await reply(update, "⛔ استهلكت حد الصفقات في باقتك الحالية.\n\n🚀 استخدم /plans للترقية والحصول على صفقات أكثر.")
+        return
     try:
         result = await asyncio.to_thread(evaluate_signal)
         if result["news_blocked"]:
@@ -1827,6 +1343,7 @@ async def trade_now(update, context):
             return
         trade = result["trade"]
         register_trade(result)
+        consume_trade(update.effective_chat.id)
         direction = "🟢 شراء" if result["direction"] == "BUY" else "🔴 بيع"
         quality = "🔥 قوية" if result["score"] >= STRONG_THRESHOLD else "🎯 مؤهلة"
         text = (
@@ -1842,6 +1359,7 @@ async def trade_now(update, context):
 
 
 async def show_levels(update, context):
+    if not await feature_guard("sr")(update, context): return
     try:
         levels = support_resistance(get_bars("1h", 250))
         text = (
@@ -1860,6 +1378,7 @@ async def show_levels(update, context):
 
 
 async def gold_price(update, context):
+    if not await feature_guard("gold_price")(update, context): return
     try:
         q = await asyncio.to_thread(live_price)
         await reply(update, f"💰 XAU/USD — السعر اللحظي\n\nالسعر: {q['price']:.2f}\nالمصدر: {q['source']}\nعمر السعر: {q.get('age')}\nتوقيت دمشق: {now_damascus().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -1868,6 +1387,7 @@ async def gold_price(update, context):
 
 
 async def daily_analysis(update, context):
+    if not await feature_guard("daily_analysis")(update, context): return
     try:
         await reply(update, await asyncio.to_thread(build_daily_analysis))
     except Exception as e:
@@ -1876,6 +1396,7 @@ async def daily_analysis(update, context):
 
 
 async def weekly_analysis(update, context):
+    if not await feature_guard("weekly_analysis")(update, context): return
     try:
         await reply(update, await asyncio.to_thread(build_weekly_analysis))
     except Exception as e:
@@ -1884,6 +1405,7 @@ async def weekly_analysis(update, context):
 
 
 async def weekly_report(update, context):
+    if not await feature_guard("weekly_report")(update, context): return
     try:
         await reply(update, await asyncio.to_thread(build_weekly_report))
     except Exception as e:
@@ -1892,6 +1414,7 @@ async def weekly_report(update, context):
 
 
 async def daily_report(update, context):
+    if not await feature_guard("daily_report")(update, context): return
     try:
         await reply(update, await asyncio.to_thread(build_daily_report))
     except Exception as e:
@@ -1900,16 +1423,19 @@ async def daily_report(update, context):
 
 
 async def news_status(update, context):
+    if not await feature_guard("news_alerts")(update, context): return
     blocked, text = news_filter()
     await reply(update, f"📰 فلتر الأخبار\n\n{'🚨 التداول محجوب' if blocked else '🟢 التداول غير محجوب'}\n\n{text}\n\nالحماية: {NEWS_BEFORE_MIN} دقيقة قبل الخبر + {NEWS_AFTER_MIN} دقيقة بعده.")
 
 
 async def markets(update, context):
+    if not await feature_guard("markets")(update, context): return
     now = now_damascus()
     await reply(update, f"🌍 جلسات السيولة\n\n🇯🇵 آسيا: تجميع ومراقبة\n🇬🇧 لندن: ارتفاع السيولة\n🇺🇸 نيويورك: أعلى التقلبات\n\n🕐 توقيت دمشق الآن: {now.strftime('%H:%M:%S')}\n\n⚠️ أوقات الافتتاح تتغير موسمياً بسبب التوقيت الصيفي.")
 
 
 async def status(update, context):
+    if not await feature_guard("status")(update, context): return
     await reply(update, (
         f"🟢 XAU SMART TRADER {VERSION}\n\n"
         "حالة النظام: يعمل\nTelegram: متصل\nFlask: يعمل\nالبيانات: Biquote OHLC\n"
@@ -1924,9 +1450,13 @@ async def status(update, context):
 # ============================================================
 
 async def subscribe(update, context):
+    _ensure_user(update)
     chat_id = update.effective_chat.id
+    if not has_feature(chat_id, "trade_alerts"):
+        await reply(update, "🔒 تنبيهات الصفقات متاحة من PRO فما فوق.\n\n💳 استخدم زر الباقات للترقية.")
+        return
     SUBSCRIBERS.add(chat_id)
-    await reply(update, f"🔔 تم تفعيل التنبيهات.\n\n🎯 حد الإشارة: {SIGNAL_THRESHOLD} نقطة\n📰 الحماية الإخبارية مفعّلة.")
+    await reply(update, f"🔔 تنبيهات الصفقات مفعّلة تلقائياً ضمن باقتك.\n\n{plan_status_text(chat_id)}")
 
 
 async def unsubscribe(update, context):
@@ -1935,44 +1465,138 @@ async def unsubscribe(update, context):
     LAST_SIGNAL.pop(chat_id, None)
     await reply(update, "🔕 تم إيقاف التنبيهات التلقائية.")
 
-async def auto_loop():
-    while True:
-        try:
-            update_trade_results()
 
-            # فحص فرص التداول مرة واحدة كل 15 دقيقة
-            await asyncio.sleep(15 * 60)
+async def plans(update, context):
+    _ensure_user(update)
+    text = plans_text() + "\n\n⬇️ اختر الباقة لمعرفة التفاصيل:"
+    keyboard = [
+        [InlineKeyboardButton("🆓 FREE", callback_data="plan_FREE")],
+        [InlineKeyboardButton("🥉 BASIC — $10", callback_data="plan_BASIC")],
+        [InlineKeyboardButton("🥈 PRO — $20", callback_data="plan_PRO")],
+        [InlineKeyboardButton("🥇 PREMIUM — $35", callback_data="plan_PREMIUM")],
+        [InlineKeyboardButton("💎 VIP — $50", callback_data="plan_VIP")],
+    ]
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    else:
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
-            if AUTO_ENABLED and SUBSCRIBERS:
-                result = await asyncio.to_thread(evaluate_signal)
 
-            if AUTO_ENABLED and SUBSCRIBERS:
-                result = await asyncio.to_thread(evaluate_signal)
-                if result["signal"] and not result["news_blocked"] and result["trade"]:
-                    trade = result["trade"]
-                    signature = (result["direction"], round(trade["entry"], 2), round(trade["sl"], 2), round(trade["tp1"], 2))
-                    for chat_id in list(SUBSCRIBERS):
-                        if LAST_SIGNAL.get(chat_id) == signature:
-                            continue
-                        direction = "🟢 شراء" if result["direction"] == "BUY" else "🔴 بيع"
-                        quality = "🔥 قوية" if result["score"] >= STRONG_THRESHOLD else "🎯 مؤهلة"
-                        text = (
-                            "🚨 إشارة ذهب جديدة\n━━━━━━━━━━━━━━━━━━\n\n"
-                            f"📈 الصفقة: {direction}\n💪 الجودة: {result['score']} نقطة — {quality}\n\n"
-                            f"💰 السعر: {result['price']:.2f}\n📍 الدخول: {trade['entry']:.2f}\n"
-                            f"🛑 SL: {trade['sl']:.2f}\n🎯 TP1: {trade['tp1']:.2f}\n🎯 TP2: {trade['tp2']:.2f}\n"
-                            f"⚖️ R:R: 1:{trade['rr']:.2f}\n\n🧠 التلاقي:\n" +
-                            "\n".join("• " + x for x in result["factors"][:7]) +
-                            "\n\n⚠️ تنفيذ يدوي فقط."
-                        )
-                        try:
-                            await APPLICATION.bot.send_message(chat_id=chat_id, text=text)
-                            LAST_SIGNAL[chat_id] = signature
-                        except Exception:
-                            logger.exception("Signal send error")
-        except Exception:
-            logger.exception("Auto loop error")
-        await asyncio.sleep(AUTO_SCAN_SECONDS)
+async def plan_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    plan_key = query.data.replace("plan_", "", 1)
+    plan = PLANS.get(plan_key)
+    if not plan:
+        await query.edit_message_text("❌ الباقة غير موجودة.")
+        return
+    feature_names = {
+        "gold_price": "💰 سعر الذهب", "markets": "🌍 الأسواق", "status": "🟢 حالة النظام",
+        "quick_analysis": "⚡ التحليل السريع", "daily_analysis": "📊 التحليل اليومي",
+        "weekly_analysis": "📅 التحليل الأسبوعي", "sr": "📍 الدعوم والمقاومات",
+        "daily_report": "📝 التقرير التوضيحي اليومي", "weekly_report": "📅 التقرير التوضيحي الأسبوعي",
+        "full_analysis": "📊 التحليل الكامل", "trade_now": "🎯 صفقة الآن",
+        "trade_alerts": "🔔 تنبيهات الصفقات", "news_alerts": "📰 تنبيهات/حماية الأخبار",
+        "market_alerts": "🌍 تنبيهات الأسواق", "institutional": "🏦 التحليل المؤسسي",
+        "trade_history": "📚 سجل الصفقات", "vip": "💎 وصول VIP الكامل"
+    }
+    features = [feature_names.get(x, x) for x in sorted(plan["features"])]
+    details = "\n".join("• " + x for x in features) or "• لا توجد ميزات إضافية"
+    limit = TRADE_LIMIT_TEXT[plan_key]
+    text = (
+        f"{plan['name']}\n━━━━━━━━━━━━━━━━━━\n"
+        f"💰 السعر: ${plan['price']} / شهر\n"
+        f"🎯 حد الصفقات: {limit}\n\n"
+        f"🔐 المزايا المتاحة: \n{details}\n\n"
+        "👇 اختر الإجراء:"
+    )
+    buttons = []
+    if plan_key != "FREE":
+        buttons.append([InlineKeyboardButton(f"📩 طلب الاشتراك في {plan['name']}", callback_data=f"request_{plan_key}")])
+    buttons.append([InlineKeyboardButton("🔙 العودة للباقات", callback_data="back_to_plans")])
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def subscription_request_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    plan_key = query.data.replace("request_", "", 1)
+    plan = PLANS.get(plan_key)
+    if not plan or plan_key == "FREE":
+        await query.edit_message_text("❌ طلب الاشتراك غير صالح.")
+        return
+    chat_id = query.message.chat_id
+    _ensure_user(update)
+    conn = _db()
+    try:
+        conn.execute("INSERT INTO subscription_requests(chat_id, plan, requested_at, status) VALUES(?,?,?, 'PENDING')", (chat_id, plan_key, now_damascus().isoformat()))
+        conn.commit()
+    finally:
+        conn.close()
+    contact = ADMIN_CONTACT
+    if contact:
+        contact_text = f"\n\n📩 تواصل مع الإدارة: {contact}"
+    else:
+        contact_text = "\n\n📩 أرسل Chat ID الخاص بك للإدارة ليتم تفعيل الباقة يدوياً."
+    await query.edit_message_text(
+        f"📩 طلب الاشتراك — {plan['name']}\n━━━━━━━━━━━━━━━━━━\n"
+        f"💰 السعر: ${plan['price']} / شهر\n"
+        f"🎯 {TRADE_LIMIT_TEXT[plan_key]}\n\n"
+        "تم تسجيل طلبك. التفعيل المدفوع يتم بعد تأكيد الإدارة." + contact_text,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 العودة للباقات", callback_data="back_to_plans")]])
+    )
+
+
+async def callback_router(update, context):
+    query = update.callback_query
+    if not query:
+        return
+    data = query.data or ""
+    if data.startswith("plan_"):
+        await plan_callback(update, context)
+    elif data.startswith("request_"):
+        await subscription_request_callback(update, context)
+    elif data == "back_to_plans":
+        await plans(update, context)
+    else:
+        await query.answer("زر غير معروف.", show_alert=True)
+
+
+async def my_subscription(update, context):
+    _ensure_user(update)
+    await reply(update, "👤 اشتراكي\n━━━━━━━━━━━━━━━━━━\n" + plan_status_text(update.effective_chat.id))
+
+
+async def referral(update, context):
+    _ensure_user(update)
+    row = get_member(update.effective_chat.id)
+    await reply(update, f"👥 رابط دعوتك\n\nhttps://t.me/" + (await APPLICATION.bot.get_me()).username + f"?start={row['referral_code']}\n\n🎁 نظام الإحالة جاهز للمكافآت والترقية.")
+
+
+async def admin_command(update, context):
+    if update.effective_user.id not in ADMIN_IDS:
+        await reply(update, "⛔ هذا الأمر مخصص للإدارة.")
+        return
+    args = context.args
+    if not args:
+        await reply(update, "🛠 /admin\n\n/activate USER_ID PLAN DAYS\nمثال: /activate 123456789 PRO 30")
+        return
+    if args[0].lower() != 'activate' or len(args) < 4:
+        await reply(update, "الصيغة: /admin activate USER_ID PLAN DAYS")
+        return
+    try:
+        user_id, plan, days = int(args[1]), args[2].upper(), int(args[3])
+        if plan not in PLANS or plan == 'FREE':
+            raise ValueError("الباقة غير صحيحة")
+        now = now_damascus(); expiry = now + timedelta(days=days)
+        conn = _db()
+        conn.execute("INSERT OR IGNORE INTO users(chat_id, plan, status, referral_code, created_at, updated_at) VALUES(?,?,?,?,?,?)", (user_id,'FREE','active',f'ref_{user_id}',now.isoformat(),now.isoformat()))
+        conn.execute("UPDATE users SET plan=?, status='active', start_date=?, expiry_date=?, updated_at=? WHERE chat_id=?", (plan, now.isoformat(), expiry.isoformat(), now.isoformat(), user_id))
+        conn.commit(); conn.close()
+        await reply(update, f"✅ تم تفعيل {PLANS[plan]['name']} للمستخدم {user_id} حتى {expiry.strftime('%Y-%m-%d %H:%M')}")
+    except Exception as e:
+        await reply(update, f"❌ تعذر التفعيل: {e}")
+
 
 # ============================================================
 # Router
@@ -1984,8 +1608,6 @@ async def router(update, context):
         "📊 التحليل الكامل": full_analysis,
         "⚡ التحليل السريع": quick_analysis,
         "🎯 صفقة الآن": trade_now,
-        "💳 الباقات": plans,
-        "👤 اشتراكي": my_subscription,
         "📍 الدعوم والمقاومات": show_levels,
         "📅 التحليل الأسبوعي": weekly_analysis,
         "📅 التقرير التوضيحي الأسبوعي": weekly_report,
@@ -1998,6 +1620,8 @@ async def router(update, context):
         "🔔 التنبيهات": subscribe,
         "🔔 تفعيل التنبيهات": subscribe,
         "🔕 إيقاف التنبيهات": unsubscribe,
+        "💳 الباقات": plans,
+        "👤 اشتراكي": my_subscription,
         "🟢 حالة النظام": status
     }
     fn = routes.get(text)
@@ -2024,133 +1648,65 @@ def webhook():
         return "OK", 200
 
 # ============================================================
+# المراقبة التلقائية — فحص كل 15 دقيقة
+# ============================================================
+
+async def auto_loop():
+    while True:
+        try:
+            update_trade_results()
+            if AUTO_ENABLED:
+                eligible = alert_subscribers()
+                SUBSCRIBERS.update(eligible)
+                SUBSCRIBERS.intersection_update(eligible)
+                if SUBSCRIBERS:
+                    result = await asyncio.to_thread(evaluate_signal)
+                    if result.get("signal") and not result.get("news_blocked") and result.get("trade"):
+                        signal_key = (result["direction"], round(result["trade"]["entry"], 1), round(result["trade"]["tp1"], 1), round(result["trade"]["sl"], 1))
+                        for chat_id in list(SUBSCRIBERS):
+                            if not can_receive_trade(chat_id) or LAST_SIGNAL.get(chat_id) == signal_key:
+                                continue
+                            try:
+                                await APPLICATION.bot.send_message(chat_id=chat_id, text=_format_trade_message(result, "🚨 إشارة ذهب — فرصة مؤهلة"))
+                                LAST_SIGNAL[chat_id] = signal_key
+                                consume_trade(chat_id)
+                            except Exception:
+                                logger.exception("Signal send error for %s", chat_id)
+                        # يسجل الصفقة مرة واحدة في سجل التحليل بعد إرسالها
+                        register_trade(result)
+        except Exception:
+            logger.exception("Auto scan error")
+        await asyncio.sleep(15 * 60)
+
+
+# ============================================================
 # تشغيل Telegram
 # ============================================================
 
-async def plan_callback(update, context):
-    query = update.callback_query
-    await query.answer()
-
-    plan_key = query.data.replace("plan_", "")
-    plan = PLANS.get(plan_key)
-
-    if not plan:
-        await query.edit_message_text("❌ الباقة غير موجودة.")
-        return
-
-    if plan_key == "FREE":
-        details = (
-            "• 📊 التحليل الأساسي\n"
-            "• 🎯 صفقة واحدة\n"
-            "• 📅 مدة 7 أيام\n"
-        )
-    elif plan_key == "BASIC":
-        details = (
-            "• 📊 التحليل اليومي\n"
-            "• 📅 التحليل الأسبوعي\n"
-            "• 📍 الدعوم والمقاومات\n"
-            "• 🎯 5 صفقات شهرياً\n"
-        )
-    elif plan_key == "PRO":
-        details = (
-            "• 📊 جميع التحليلات الأساسية\n"
-            "• 🧠 تحليل هيكلي وكمي\n"
-            "• 📍 الدعوم والمقاومات\n"
-            "• 🎯 20 صفقة شهرياً\n"
-            "• 🔔 تنبيهات الصفقات\n"
-        )
-    elif plan_key == "PREMIUM":
-        details = (
-            "• 📊 جميع التحليلات\n"
-            "• 🧠 التحليل المؤسسي والكمي\n"
-            "• 📍 جميع مستويات S/R\n"
-            "• 🎯 50 صفقة شهرياً\n"
-            "• 🔔 تنبيهات الأخبار والصفقات\n"
-        )
-    else:  # VIP
-        details = (
-            "• 📊 جميع التحليلات\n"
-            "• 🧠 التحليل المؤسسي والكمي الكامل\n"
-            "• 📍 جميع مستويات S/R\n"
-            "• 🎯 صفقات غير محدودة\n"
-            "• 🔔 جميع التنبيهات\n"
-            "• 💎 وصول VIP الكامل\n"
-        )
-
-    price = plan["price"]
-    days = plan["trade_period_days"]
-
-    text = (
-        f"{plan['name']}\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"💰 السعر: ${price} / شهر\n"
-        f"📅 المدة: {days} يوم\n\n"
-        "🔐 ما تحصل عليه:\n"
-        f"{details}\n"
-        "👇 اختر الإجراء:"
-    )
-
-    keyboard = [
-        [InlineKeyboardButton(
-            f"✅ الاشتراك في {plan['name']}",
-            callback_data=f"subscribe_{plan_key}"
-        )],
-        [InlineKeyboardButton(
-            "🔙 العودة للباقات",
-            callback_data="back_to_plans"
-        )]
-    ]
-
-    await query.edit_message_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-async def plans(update, context):
-    _ensure_user(update)
-    
-if query.data == "back_to_plans":
-    await plans(update, context)
-    return
-    text = (
-        "💳 نظام الاشتراكات\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "اختر الباقة المناسبة لك 👇\n\n"
-        "🥉 BASIC — $10 / شهر\n"
-        "🥈 PRO — $20 / شهر\n"
-        "🥇 PREMIUM — $35 / شهر\n"
-        "💎 VIP — $50 / شهر\n\n"
-        "⬇️ اضغط على الباقة لمعرفة تفاصيلها:"
-    )
-
-    keyboard = [
-        [InlineKeyboardButton("🥉 BASIC — $10", callback_data="plan_BASIC")],
-        [InlineKeyboardButton("🥈 PRO — $20", callback_data="plan_PRO")],
-        [InlineKeyboardButton("🥇 PREMIUM — $35", callback_data="plan_PREMIUM")],
-        [InlineKeyboardButton("💎 VIP — $50", callback_data="plan_VIP")],
-    ]
-
-    if update.callback_query:
-        await update.callback_query.edit_message_text(
-            text,
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-    else:
-        await update.message.reply_text(
-            text,
-            reply_markup=InlineKeyboardMarkup(keyboard)
-    )
 async def start_bot():
     global APPLICATION
     if not TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN غير موجود في Render.")
 
     APPLICATION = Application.builder().token(TOKEN).build()
-
     APPLICATION.add_handler(CommandHandler("start", start))
-    APPLICATION.add_handler(CallbackQueryHandler(plan_callback, pattern=r"^plan_"))
+    APPLICATION.add_handler(CommandHandler("plans", plans))
+    APPLICATION.add_handler(CommandHandler("subscription", my_subscription))
+    APPLICATION.add_handler(CommandHandler("referral", referral))
+    APPLICATION.add_handler(CommandHandler("admin", admin_command))
+    APPLICATION.add_handler(CallbackQueryHandler(callback_router))
     APPLICATION.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, router))
 
     await APPLICATION.initialize()
+    await APPLICATION.start()
+    await APPLICATION.bot.set_webhook(url=WEBHOOK_URL, allowed_updates=["message", "callback_query"], drop_pending_updates=True)
+
+    logger.info("XAU SMART TRADER %s started", VERSION)
+    logger.info("Webhook: %s", WEBHOOK_URL)
+    asyncio.create_task(auto_loop())
+
+    while True:
+        await asyncio.sleep(3600)
 
 # ============================================================
 # Flask Server
@@ -2164,7 +1720,6 @@ def run_flask():
 # ============================================================
 
 def main():
-        init_subscription_db()
     global BOT_LOOP
     server = threading.Thread(target=run_flask, daemon=True)
     server.start()
