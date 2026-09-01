@@ -906,29 +906,136 @@ def scenario_quality(mtf, direction, levels, price, preferred=True):
 
 def build_trade(direction, h1, m15, levels):
     """
-    بناء صفقة عملية وقابلة للتحقق.
-
-    القواعد:
-    - لا نعتمد على وجود S/R حتى لا تضيع الصفقة.
-    - إذا وجد مستوى S/R قريب ومنطقي نستخدمه كهدف.
-    - إذا لم يوجد، نستخدم TP مبني على ATR.
+    بناء صفقة عملية:
+    - لا تعتمد الصفقة على وجود S/R حتى يتم إصدارها.
     - TP1 قريب وقابل للتحقق.
     - TP2 ممتد باعتدال.
-    - لا نخفض حد الإشارة ولا نغير نظام النقاط.
+    - استخدام S/R فقط إذا كان المستوى قريباً ومنطقياً.
+    - عند غياب S/R يتم استخدام ATR كبديل.
     """
 
-    price = float(m15["price"])
-    atr = max(float(m15["atr"]), 0.50)
+    price = m15["price"]
+    atr = max(m15["atr"], 0.50)
 
     s1 = levels.get("support1")
     s2 = levels.get("support2")
+
     r1 = levels.get("resistance1")
     r2 = levels.get("resistance2")
 
-    s1_price = s1["price"] if s1 else None
-    s2_price = s2["price"] if s2 else None
-    r1_price = r1["price"] if r1 else None
-    r2_price = r2["price"] if r2 else None
+    if direction == "BUY":
+
+        entry = price
+
+        # SL يعتمد على أقرب دعم إن كان قريباً
+        if (
+            s1
+            and s1["price"] < entry
+            and entry - s1["price"] <= atr * 1.10
+        ):
+            sl = s1["price"] - atr * 0.15
+        else:
+            sl = entry - atr * 0.95
+
+        risk = abs(entry - sl)
+
+        # TP1 طبيعي وقريب
+        natural_tp1 = entry + max(
+            atr * 1.10,
+            risk * 1.05
+        )
+
+        # لا نستخدم R1 إذا كان بعيداً
+        if (
+            r1
+            and r1["price"] > entry
+            and r1["price"] - entry <= atr * 1.35
+        ):
+            tp1 = r1["price"]
+        else:
+            tp1 = natural_tp1
+
+        # TP2
+        natural_tp2 = entry + max(
+            atr * 1.75,
+            risk * 1.55
+        )
+
+        if (
+            r2
+            and r2["price"] > tp1
+            and r2["price"] - entry <= atr * 2.10
+        ):
+            tp2 = r2["price"]
+        else:
+            tp2 = natural_tp2
+
+    elif direction == "SELL":
+
+        entry = price
+
+        # SL يعتمد على أقرب مقاومة إن كانت قريبة
+        if (
+            r1
+            and r1["price"] > entry
+            and r1["price"] - entry <= atr * 1.10
+        ):
+            sl = r1["price"] + atr * 0.15
+        else:
+            sl = entry + atr * 0.95
+
+        risk = abs(entry - sl)
+
+        # TP1 طبيعي وقريب
+        natural_tp1 = entry - max(
+            atr * 1.10,
+            risk * 1.05
+        )
+
+        # لا نستخدم S1 إذا كان بعيداً
+        if (
+            s1
+            and s1["price"] < entry
+            and entry - s1["price"] <= atr * 1.35
+        ):
+            tp1 = s1["price"]
+        else:
+            tp1 = natural_tp1
+
+        # TP2
+        natural_tp2 = entry - max(
+            atr * 1.75,
+            risk * 1.55
+        )
+
+        if (
+            s2
+            and s2["price"] < tp1
+            and entry - s2["price"] <= atr * 2.10
+        ):
+            tp2 = s2["price"]
+        else:
+            tp2 = natural_tp2
+
+    else:
+        return None
+
+    # ------------------------------------------------------------
+    # التأكد من منطقية الأهداف
+    # ------------------------------------------------------------
+
+    risk = abs(entry - sl)
+    reward = abs(tp2 - entry)
+
+    rr = reward / risk if risk > 0 else 0
+
+    return {
+        "entry": entry,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "rr": rr,
+        }
 
     # ------------------------------------------------------------
     # BUY
