@@ -795,29 +795,119 @@ def scenario_quality(mtf, direction, levels, price, preferred=True):
 
 
 def build_trade(direction, h1, m15, levels):
-    price = m15["price"]
-    atr = max(m15["atr"], 0.50)
-    s1, s2 = levels.get("support1"), levels.get("support2")
-    r1, r2 = levels.get("resistance1"), levels.get("resistance2")
+    """
+    بناء صفقة عملية وقابلة للتحقق.
 
+    القواعد:
+    - لا نعتمد على وجود S/R حتى لا تضيع الصفقة.
+    - إذا وجد مستوى S/R قريب ومنطقي نستخدمه كهدف.
+    - إذا لم يوجد، نستخدم TP مبني على ATR.
+    - TP1 قريب وقابل للتحقق.
+    - TP2 ممتد باعتدال.
+    - لا نخفض حد الإشارة ولا نغير نظام النقاط.
+    """
+
+    price = float(m15["price"])
+    atr = max(float(m15["atr"]), 0.50)
+
+    s1 = levels.get("support1")
+    s2 = levels.get("support2")
+    r1 = levels.get("resistance1")
+    r2 = levels.get("resistance2")
+
+    s1_price = s1["price"] if s1 else None
+    s2_price = s2["price"] if s2 else None
+    r1_price = r1["price"] if r1 else None
+    r2_price = r2["price"] if r2 else None
+
+    # ------------------------------------------------------------
+    # BUY
+    # ------------------------------------------------------------
     if direction == "BUY":
+
         entry = price
-        sl = min(entry - atr * 1.10, s1["price"] - atr * 0.20) if s1 else entry - atr * 1.20
-        tp1 = r1["price"] if r1 and r1["price"] > entry else entry + atr * 1.50
-        tp2 = r2["price"] if r2 and r2["price"] > tp1 else entry + atr * 2.50
+
+        # وقف منطقي بدون الاعتماد الإجباري على S1
+        if s1_price is not None and 0 < entry - s1_price <= atr * 1.10:
+            sl = s1_price - atr * 0.15
+        else:
+            sl = entry - atr * 0.95
+
+        risk = abs(entry - sl)
+
+        # أهداف ATR عملية وأقرب من الإصدار السابق
+        natural_tp1 = entry + max(atr * 1.10, risk * 1.05)
+        natural_tp2 = entry + max(atr * 1.60, risk * 1.50)
+
+        # TP1: استخدم المقاومة القريبة فقط إذا كانت منطقية
+        if r1_price is not None and entry < r1_price <= entry + atr * 1.35:
+            tp1 = r1_price
+        else:
+            tp1 = natural_tp1
+
+        # TP2: استخدم المقاومة التالية إذا كانت منطقية
+        if r2_price is not None and tp1 < r2_price <= entry + atr * 2.00:
+            tp2 = r2_price
+        else:
+            tp2 = natural_tp2
+
+        # ضمان أن TP2 أبعد من TP1
+        if tp2 <= tp1:
+            tp2 = max(natural_tp2, tp1 + atr * 0.35)
+
+    # ------------------------------------------------------------
+    # SELL
+    # ------------------------------------------------------------
     elif direction == "SELL":
+
         entry = price
-        sl = max(entry + atr * 1.10, r1["price"] + atr * 0.20) if r1 else entry + atr * 1.20
-        tp1 = s1["price"] if s1 and s1["price"] < entry else entry - atr * 1.50
-        tp2 = s2["price"] if s2 and s2["price"] < tp1 else entry - atr * 2.50
+
+        # وقف منطقي بدون الاعتماد الإجباري على R1
+        if r1_price is not None and 0 < r1_price - entry <= atr * 1.10:
+            sl = r1_price + atr * 0.15
+        else:
+            sl = entry + atr * 0.95
+
+        risk = abs(entry - sl)
+
+        # أهداف ATR عملية وأقرب من الإصدار السابق
+        natural_tp1 = entry - max(atr * 1.10, risk * 1.05)
+        natural_tp2 = entry - max(atr * 1.60, risk * 1.50)
+
+        # TP1: استخدم الدعم القريب فقط إذا كان منطقيًا
+        if s1_price is not None and entry > s1_price >= entry - atr * 1.35:
+            tp1 = s1_price
+        else:
+            tp1 = natural_tp1
+
+        # TP2: استخدم الدعم التالي إذا كان منطقيًا
+        if s2_price is not None and tp1 > s2_price >= entry - atr * 2.00:
+            tp2 = s2_price
+        else:
+            tp2 = natural_tp2
+
+        # ضمان أن TP2 أبعد من TP1
+        if tp2 >= tp1:
+            tp2 = min(natural_tp2, tp1 - atr * 0.35)
+
     else:
         return None
 
+    # ------------------------------------------------------------
+    # حساب R:R
+    # ------------------------------------------------------------
     risk = abs(entry - sl)
     reward = abs(tp2 - entry)
-    rr = reward / risk if risk > 0 else 0
-    return {"entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "rr": rr}
 
+    rr = reward / risk if risk > 0 else 0
+
+    return {
+        "entry": round(entry, 2),
+        "sl": round(sl, 2),
+        "tp1": round(tp1, 2),
+        "tp2": round(tp2, 2),
+        "rr": round(rr, 2),
+    }
 # ============================================================
 # الأخبار
 # ============================================================
