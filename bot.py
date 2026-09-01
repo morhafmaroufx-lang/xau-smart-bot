@@ -1831,11 +1831,17 @@ async def unsubscribe(update, context):
     LAST_SIGNAL.pop(chat_id, None)
     await reply(update, "🔕 تم إيقاف التنبيهات التلقائية.")
 
-
 async def auto_loop():
     while True:
         try:
             update_trade_results()
+
+            # فحص فرص التداول مرة واحدة كل 15 دقيقة
+            await asyncio.sleep(15 * 60)
+
+            if AUTO_ENABLED and SUBSCRIBERS:
+                result = await asyncio.to_thread(evaluate_signal)
+
             if AUTO_ENABLED and SUBSCRIBERS:
                 result = await asyncio.to_thread(evaluate_signal)
                 if result["signal"] and not result["news_blocked"] and result["trade"]:
