@@ -537,51 +537,161 @@ def find_fvg(df):
 
 
 def support_resistance(df, lookback=120):
-    x = df.tail(min(lookback, len(df)))
-    current = sf(x["close"].iloc[-1])
-    atr = sf(ATR(x).iloc[-1], 1)
-    radius = max(atr * 0.35, current * 0.00035)
-    supports, resistances = [], []
+    """
+    بناء دعم ومقاومة عملية ومرتبة حسب السعر الحالي.
 
+    القواعد:
+    - الدعم يجب أن يكون تحت السعر الحالي.
+    - المقاومة يجب أن تكون فوق السعر الحالي.
+    - S1/R1 الأقرب للسعر.
+    - S2/R2 المستوى التالي.
+    - S3/R3 المستوى الأبعد.
+    - التجميع يتم باستخدام ATR.
+    - لا يتم إدخال مستوى من الجهة الخاطئة.
+    """
+
+    x = df.tail(min(lookback, len(df))).copy()
+
+    if len(x) < 10:
+        return {
+            "support1": None,
+            "support2": None,
+            "support3": None,
+            "resistance1": None,
+            "resistance2": None,
+            "resistance3": None,
+            "atr": 0.0
+        }
+
+    current = sf(x["close"].iloc[-1])
+    atr = max(sf(ATR(x).iloc[-1], 1), 0.01)
+
+    # مسافة تجميع المناطق حسب ATR
+    radius = max(atr * 0.35, current * 0.00035)
+
+    supports = []
+    resistances = []
+
+    # ------------------------------------------------------------
+    # استخراج القمم والقيعان
+    # ------------------------------------------------------------
     for i in range(2, len(x) - 2):
-        low, high = sf(x["low"].iloc[i]), sf(x["high"].iloc[i])
+
+        low = sf(x["low"].iloc[i])
+        high = sf(x["high"].iloc[i])
+
         left_low = sf(x["low"].iloc[i-2:i].min())
         right_low = sf(x["low"].iloc[i+1:i+3].min())
+
         left_high = sf(x["high"].iloc[i-2:i].max())
         right_high = sf(x["high"].iloc[i+1:i+3].max())
+
+        # قاع واضح + أسفل السعر الحالي = دعم
         if low <= left_low and low <= right_low and low < current:
             supports.append(low)
+
+        # قمة واضحة + فوق السعر الحالي = مقاومة
         if high >= left_high and high >= right_high and high > current:
             resistances.append(high)
 
+    # ------------------------------------------------------------
+    # تجميع المستويات المتقاربة
+    # ------------------------------------------------------------
     def cluster(values):
+
+        if not values:
+            return []
+
         values = sorted(values)
         groups = []
+
         for price in values:
+
             if not groups:
                 groups.append([price])
                 continue
+
             center = sum(groups[-1]) / len(groups[-1])
+
             if abs(price - center) <= radius:
                 groups[-1].append(price)
             else:
                 groups.append([price])
+
         zones = []
+
         for group in groups:
+
             center = sum(group) / len(group)
+
+            # قوة المنطقة تعتمد على عدد اللمسات
             strength = min(100, 40 + len(group) * 15)
-            zones.append({"price": center, "strength": strength, "touches": len(group)})
+
+            zones.append({
+                "price": center,
+                "strength": strength,
+                "touches": len(group)
+            })
+
         return zones
 
-    s = sorted(cluster(supports), key=lambda z: abs(current - z["price"]))[:3]
-    r = sorted(cluster(resistances), key=lambda z: abs(current - z["price"]))[:3]
+    support_zones = cluster(supports)
+    resistance_zones = cluster(resistances)
+
+    # ------------------------------------------------------------
+    # فلترة صارمة حسب موقع السعر
+    # ------------------------------------------------------------
+
+    support_zones = [
+        z for z in support_zones
+        if z["price"] < current
+    ]
+
+    resistance_zones = [
+        z for z in resistance_zones
+        if z["price"] > current
+    ]
+
+    # ------------------------------------------------------------
+    # ترتيب الدعم:
+    # S1 الأقرب
+    # S2 التالي
+    # S3 الأبعد
+    # ------------------------------------------------------------
+
+    support_zones = sorted(
+        support_zones,
+        key=lambda z: current - z["price"]
+    )
+
+    # ------------------------------------------------------------
+    # ترتيب المقاومة:
+    # R1 الأقرب
+    # R2 التالي
+    # R3 الأبعد
+    # ------------------------------------------------------------
+
+    resistance_zones = sorted(
+        resistance_zones,
+        key=lambda z: z["price"] - current
+    )
+
+    # ------------------------------------------------------------
+    # أخذ أول 3 مستويات فقط
+    # ------------------------------------------------------------
+
+    s = support_zones[:3]
+    r = resistance_zones[:3]
+
     return {
         "support1": s[0] if len(s) > 0 else None,
         "support2": s[1] if len(s) > 1 else None,
         "support3": s[2] if len(s) > 2 else None,
+
         "resistance1": r[0] if len(r) > 0 else None,
         "resistance2": r[1] if len(r) > 1 else None,
         "resistance3": r[2] if len(r) > 2 else None,
+
         "atr": atr
     }
 
