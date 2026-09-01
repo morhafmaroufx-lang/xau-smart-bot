@@ -970,55 +970,159 @@ def build_trade(direction, h1, m15, levels):
         else:
             tp2 = natural_tp2
 
+
+        def build_trade(direction, h1, m15, levels):
+    """
+    بناء صفقة عملية وقابلة للتنفيذ.
+
+    القواعد:
+    - لا نعتمد على S/R إذا كان بعيداً عن السعر.
+    - TP1 قريب وواقعي.
+    - TP2 ممتد باعتدال.
+    - غياب S/R لا يمنع إنشاء الصفقة.
+    - لا علاقة لهذه الدالة بحد الإشارة؛ قرار التأهل يبقى كما هو.
+    """
+
+    price = float(m15["price"])
+    atr = max(float(m15["atr"]), 0.50)
+
+    s1 = levels.get("support1")
+    s2 = levels.get("support2")
+    r1 = levels.get("resistance1")
+    r2 = levels.get("resistance2")
+
+    # =========================================================
+    # حدود المسافات المسموح بها للأهداف
+    # =========================================================
+    tp1_max_distance = atr * 1.50
+    tp2_max_distance = atr * 2.40
+
+    # =========================================================
+    # BUY
+    # =========================================================
+    if direction == "BUY":
+
+        entry = price
+
+        # SL يعتمد على الدعم القريب إن كان منطقياً
+        if s1 and entry > s1["price"]:
+            support_distance = entry - s1["price"]
+
+            if support_distance <= atr * 1.20:
+                sl = s1["price"] - atr * 0.15
+            else:
+                sl = entry - atr * 1.00
+        else:
+            sl = entry - atr * 1.00
+
+        risk = abs(entry - sl)
+
+        # -----------------------------------------------------
+        # TP1
+        # -----------------------------------------------------
+        tp1 = None
+
+        if r1 and r1["price"] > entry:
+            r1_distance = r1["price"] - entry
+
+            if r1_distance <= tp1_max_distance:
+                tp1 = r1["price"]
+
+        # إذا لم يوجد R1 مناسب → هدف ATR
+        if tp1 is None:
+            tp1 = entry + max(atr * 1.10, risk * 1.05)
+
+        # -----------------------------------------------------
+        # TP2
+        # -----------------------------------------------------
+        tp2 = None
+
+        if r2 and r2["price"] > tp1:
+            r2_distance = r2["price"] - entry
+
+            if r2_distance <= tp2_max_distance:
+                tp2 = r2["price"]
+
+        # إذا لم يوجد R2 مناسب → هدف ATR منطقي
+        if tp2 is None:
+            tp2 = entry + max(atr * 1.75, risk * 1.50)
+
+        # ضمان أن TP2 أكبر من TP1
+        if tp2 <= tp1:
+            tp2 = tp1 + atr * 0.50
+
+    # =========================================================
+    # SELL
+    # =========================================================
     elif direction == "SELL":
 
         entry = price
 
-        # SL يعتمد على أقرب مقاومة إن كانت قريبة
-        if (
-            r1
-            and r1["price"] > entry
-            and r1["price"] - entry <= atr * 1.10
-        ):
-            sl = r1["price"] + atr * 0.15
+        # SL يعتمد على المقاومة القريبة إن كانت منطقية
+        if r1 and r1["price"] > entry:
+            resistance_distance = r1["price"] - entry
+
+            if resistance_distance <= atr * 1.20:
+                sl = r1["price"] + atr * 0.15
+            else:
+                sl = entry + atr * 1.00
         else:
-            sl = entry + atr * 0.95
+            sl = entry + atr * 1.00
 
         risk = abs(entry - sl)
 
-        # TP1 طبيعي وقريب
-        natural_tp1 = entry - max(
-            atr * 1.10,
-            risk * 1.05
-        )
+        # -----------------------------------------------------
+        # TP1
+        # -----------------------------------------------------
+        tp1 = None
 
-        # لا نستخدم S1 إذا كان بعيداً
-        if (
-            s1
-            and s1["price"] < entry
-            and entry - s1["price"] <= atr * 1.35
-        ):
-            tp1 = s1["price"]
-        else:
-            tp1 = natural_tp1
+        if s1 and s1["price"] < entry:
+            s1_distance = entry - s1["price"]
 
+            if s1_distance <= tp1_max_distance:
+                tp1 = s1["price"]
+
+        # إذا لم يوجد S1 مناسب → هدف ATR
+        if tp1 is None:
+            tp1 = entry - max(atr * 1.10, risk * 1.05)
+
+        # -----------------------------------------------------
         # TP2
-        natural_tp2 = entry - max(
-            atr * 1.75,
-            risk * 1.55
-        )
+        # -----------------------------------------------------
+        tp2 = None
 
-        if (
-            s2
-            and s2["price"] < tp1
-            and entry - s2["price"] <= atr * 2.10
-        ):
-            tp2 = s2["price"]
-        else:
-            tp2 = natural_tp2
+        if s2 and s2["price"] < tp1:
+            s2_distance = entry - s2["price"]
+
+            if s2_distance <= tp2_max_distance:
+                tp2 = s2["price"]
+
+        # إذا لم يوجد S2 مناسب → هدف ATR منطقي
+        if tp2 is None:
+            tp2 = entry - max(atr * 1.75, risk * 1.50)
+
+        # ضمان أن TP2 أقل من TP1
+        if tp2 >= tp1:
+            tp2 = tp1 - atr * 0.50
 
     else:
         return None
+
+    # =========================================================
+    # الحساب النهائي
+    # =========================================================
+    risk = abs(entry - sl)
+    reward = abs(tp2 - entry)
+
+    rr = reward / risk if risk > 0 else 0
+
+    return {
+        "entry": round(entry, 2),
+        "sl": round(sl, 2),
+        "tp1": round(tp1, 2),
+        "tp2": round(tp2, 2),
+        "rr": round(rr, 2)
+        }
 
     # ------------------------------------------------------------
     # التأكد من منطقية الأهداف
